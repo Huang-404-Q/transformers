@@ -16,7 +16,7 @@ rendered properly in your Markdown viewer.
 
 # Fine-grained
 
-The block-scaled formats, [FP8](./fp8) among them, are low-precision
+[FP8](./fp8) and [MXFP4](./mxfp4) are block-scaled formats: low-precision
 weights with one scale per block or group of values. They share one integration and one kernel bundle,
 [finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels), and each has its own config that
 quantizes a whole model. [`FineGrainedConfig`] mixes them in one model. This page covers what they share; the format
@@ -29,6 +29,7 @@ pip install --upgrade accelerate "kernels>=0.17.2,<0.18"
 ```
 
 - Quantized compute needs a CUDA GPU with compute capability 8.9 or newer (Ada, Hopper, Blackwell) or an Intel XPU.
+  Weight-only MXFP4 (W4A16, how GPT-OSS runs) only needs compute capability 7.5.
 - Without a GPU, or below the required compute capability, a pre-quantized checkpoint is dequantized to bf16 as it
   loads. Quantizing a full-precision checkpoint on the fly raises an error without a GPU, and below the required
   compute capability loads the model unquantized.
@@ -66,11 +67,31 @@ differs from them is ignored with a warning.
 quantized in. A typical plan holds the MoE experts, which carry most of the weights, in a 4-bit format and every other
 linear in 8 bits.
 
+```py
+from transformers import AutoModelForCausalLM, Fp8Config, FineGrainedConfig, Mxfp4Config
+
+quantization_config = FineGrainedConfig(
+    dtype_plan={
+        r"\.experts($|\.)": Mxfp4Config(),
+        ".*": Fp8Config(),
+    },
+)
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-30B-A3B", dtype="auto", device_map="auto", quantization_config=quantization_config
+)
+```
+
 - A pattern names the modules it matches with `re.search`. A targeted entry wins over the `".*"` catch-all, whatever
   order the plan is written in, since a plan saved to `config.json` loses its order. Two targeted entries matching one
   module raise an error.
 - A module no entry matches, or that `modules_to_not_convert` names, stays in full precision.
 - The loading options (`dequantize`, `modules_to_not_convert`) belong to the plan, not to its entries.
+
+These checkpoints load as a [`FineGrainedConfig`] without one being passed:
+
+- DeepSeek-V4 ships block-FP8 weights with MXFP4 routed experts. Its checkpoint declares `quant_method="fp8"` and its
+  model config `expert_dtype="fp4"` (DeepSeek-V4.1 declares it in its quantization config), which together read as a
+  plan of MXFP4 experts over block FP8. See [DeepSeek-V4](../model_doc/deepseek_v4) for the plan written out.
 
 ## Tensor and expert parallelism
 
