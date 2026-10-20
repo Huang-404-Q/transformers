@@ -1,0 +1,400 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""The `finegrained` integration's modules, no kernel involved: what replaces what, what the modules hold and
+hand the kernels, and the parallel plans a quantized model needs. The kernel call contract lives in
+`tests/kernels/test_finegrained.py`, the conversion ops in `test_conversions.py`."""
+
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+import transformers.integrations.finegrained.layers as fg
+from transformers.integrations.finegrained import FineGrainedExperts, FineGrainedLinear
+from transformers.integrations.moe import check_experts_weight_layout
+from transformers.testing_utils import require_torch
+from transformers.utils.quantization_config import Fp8Config
+
+from .utils import (
+    _Cfg,
+    _format_config,
+    _quantizer_for,
+    _replace,
+    _tiny_config,
+    fake_finegrained_kernel,
+    patch_finegrained_kernel,
+)
+
+
+def _block_scaled_matmul_2d(A, B, As, Bs, *, output_dtype=None, **kwargs):
+    """`matmul_2d`'s contract on a block-scaled weight: the grid read row-major, its block inferred from the shapes."""
+    block_n, block_k = B.shape[0] // Bs.shape[0], B.shape[1] // Bs.shape[1]
+    weight = B.float() * Bs.float().repeat_interleave(block_n, 0).repeat_interleave(block_k, 1)
+    return (A.float() @ weight.T).to(output_dtype)
+
+
+@require_torch
+class FineGrainedModulesTest(unittest.TestCase):
+    """The finegrained modules themselves: what they hold and what replaces what."""
+
+    def test_storage_can_be_built_on_meta_without_a_full_precision_table(self):
+        with torch.device("meta"):
+            m = fg.FineGrainedEmbedding(320001536, 160)
+        self.assertEqual(m.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(m.weight_scale.shape, (1,))
+        self.assertTrue(all(p.is_meta for p in m.parameters()))
+
+    def test_only_weights_need_on_the_fly_quantization(self):
+        config = Fp8Config()
+        quantizer = _quantizer_for(config)
+        quantizer.pre_quantized = False
+        model = torch.nn.Module()
+        model.linear = FineGrainedLinear(64, 64, has_bias=True, quantization_config=config)
+        model.experts = FineGrainedExperts(_Cfg(), quantization_config=config, has_bias=True)
+        for module_name, module in model.named_children():
+            weights = {"weight"} if module_name == "linear" else {"gate_up_proj", "down_proj"}
+            for name, _ in module.named_parameters(recurse=False):
+                with self.subTest(parameter=f"{module_name}.{name}"):
+                    self.assertEqual(
+                        quantizer.param_needs_quantization(model, f"{module_name}.{name}"), name in weights
+                    )
+
+    def test_replacement_respects_a_disabled_post_expert_norm(self):
+        from transformers.integrations.moe import use_experts_implementation
+
+        @use_experts_implementation(has_post_expert_norm=False)
+        class Experts(torch.nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                self.post_expert_norm = torch.nn.RMSNorm(config.hidden_size)
+
+            def forward(self, hidden_states, top_k_index, top_k_weights):
+                return hidden_states
+
+        config = _Cfg()
+        source = Experts(config)
+        self.assertFalse(source.has_post_expert_norm)
+        model = SimpleNamespace(config=SimpleNamespace(get_text_config=lambda: config))
+        quantized = FineGrainedExperts.from_module(source, Fp8Config(), model)
+        self.assertIs(quantized.post_expert_norm, source.post_expert_norm)
+        self.assertFalse(quantized.has_post_expert_norm)
+
+    def test_a_grouped_linear_is_recognised_by_its_groups_not_its_name(self):
+        """`replace_with_quantized_modules` picks `FineGrainedGroupedLinear` for a block-diagonal
+        linear — a plain one would collapse the groups into a single giant matmul and return the
+        wrong output dim. The branch keys on `n_groups`, the attribute the swap consumes: a class
+        NAME substring would miss a grouped linear named anything else, and would match (then
+        `AttributeError` on) one that carries its group count under another name.
+        """
+        from transformers.integrations.finegrained import FineGrainedGroupedLinear
+
+        class OddlyNamedBlockDiagonal(torch.nn.Linear):
+            def __init__(self):
+                super().__init__(8, 16, bias=False)
+                self.n_groups = 2
+
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace())
+        model.grouped = OddlyNamedBlockDiagonal()
+        model.plain = torch.nn.Linear(8, 16, bias=False)
+
+        with torch.device("meta"):
+            _replace(model, Fp8Config())
+        self.assertIsInstance(model.grouped, FineGrainedGroupedLinear)
+        self.assertNotIsInstance(model.plain, FineGrainedGroupedLinear)
+
+    def test_lookup_rescales_the_gathered_rows(self):
+        torch.manual_seed(0)
+        table = torch.randn(64, 16)
+        scale = table.abs().max() / 448.0
+        embedding = fg.FineGrainedEmbedding(64, 16)
+        embedding.weight = torch.nn.Parameter((table / scale).to(torch.float8_e4m3fn), requires_grad=False)
+        embedding.weight_scale = torch.nn.Parameter(scale.to(torch.bfloat16).reshape(1), requires_grad=False)
+        ids = torch.tensor([[3, 7], [60, 0]])
+        out = embedding(ids)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        expected = (table / scale).to(torch.float8_e4m3fn)[ids].to(torch.bfloat16) * scale.to(torch.bfloat16)
+        torch.testing.assert_close(out, expected)
+
+    def test_an_empty_plan_replaces_nothing(self):
+        """A dequantized load walks an empty plan; it must not fall back to the quantizer's own."""
+        model = torch.nn.Sequential(torch.nn.Linear(256, 256))
+        model.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace())
+        self.assertFalse(_quantizer_for(Fp8Config()).replace_modules(model, plan={}))
+        self.assertIsInstance(model[0], torch.nn.Linear)
+
+    def test_replacement_follows_the_patterns_and_the_skip_list(self):
+        """A table is quantized where `modules_to_convert` names it, never through the plan's catch-all."""
+
+        model = torch.nn.Module()
+        model.ngram_embedding = torch.nn.Embedding(8, 4)
+        model.embed_tokens = torch.nn.Embedding(8, 4)
+        model.other = torch.nn.Embedding(8, 4)
+        _replace(model, Fp8Config(modules_to_convert=["ngram_embedding", "other"]), ["other"])
+        self.assertIsInstance(model.ngram_embedding, fg.FineGrainedEmbedding)
+        self.assertTrue(model.ngram_embedding.tp_uses_local_tensors)
+        self.assertIs(type(model.embed_tokens), torch.nn.Embedding)
+        self.assertIs(type(model.other), torch.nn.Embedding)
+
+    # `from_pretrained` sets the default dtype to the checkpoint's during construction, so a scale
+    # allocated as `torch.ones(n)` comes out bf16 and the kernels read it as fp32 (NaN logits, no
+    # error). Building under both defaults catches it.
+    def _dtypes(self, build, default):
+        previous = torch.get_default_dtype()
+        torch.set_default_dtype(default)
+        try:
+            with torch.device("meta"):
+                module = build()
+            return {name: p.dtype for name, p in module.named_parameters() if p is not None}
+        finally:
+            torch.set_default_dtype(previous)
+
+    def _assert_default_dtype_invariant(self, build):
+        under_fp32 = self._dtypes(build, torch.float32)
+        under_bf16 = self._dtypes(build, torch.bfloat16)
+        self.assertTrue(under_fp32)
+        # the weight and bias DO follow the model dtype; every scale beside them must not
+        scales = {name for name in under_fp32 if "scale" in name}
+        self.assertTrue(scales)
+        for name in sorted(scales):
+            self.assertEqual(under_bf16[name], under_fp32[name], f"{name} followed the default dtype")
+
+    def test_static_activation_scheme_reaches_the_fused_chain(self):
+        """Mistral-3 ships `activation_scheme="static"`: a calibrated scale per activation, and a
+        MoE calibrates each expert separately, so the module holds one per expert. Both fused
+        chains take them per projection and the kernels apply each tile's own expert scale in
+        register — a host pre-quant could not, since top-k routes one row to several experts
+        whose scales differ. A dynamic module holds no such slot and passes `None`."""
+        static, dynamic = (
+            FineGrainedExperts(
+                _Cfg(), quantization_config=Fp8Config(weight_block_size=(128, 128), activation_scheme=scheme)
+            )
+            for scheme in ("static", "dynamic")
+        )
+        held = static.gate_up_proj_activation_scale
+        self.assertIsNotNone(held, "the calibrated scale the chain needs")
+        self.assertEqual(held.numel(), _Cfg.num_local_experts, "one per expert, which the kernels index")
+        # a dynamic module holds the slot empty, like every other optional parameter
+        self.assertIsNone(dynamic.gate_up_proj_activation_scale)
+
+        kernel = mock.Mock()
+        kernel.get_supported_act_fns.return_value = ("silu",)
+        kernel.get_supported_norms.return_value = ()
+        for module, calibrated in ((static, True), (dynamic, False)):
+            operands = module._moe_operands(kernel)
+            for projection in ("gate_up_proj", "down_proj"):
+                with self.subTest(scheme=module.activation_scheme, projection=projection):
+                    scale = operands[f"{projection}_activation_scale"]
+                    self.assertEqual(scale is not None, calibrated)
+                    if calibrated:
+                        self.assertEqual(scale.numel(), _Cfg.num_local_experts)
+
+    def test_moe_operands_gather_the_tensors_each_call(self):
+        """Only the non-tensor operands are resolved once: a Parameter the loader, a TP shard or the megamoe setup
+        swaps in after the first forward reaches the kernels on the next."""
+        experts = FineGrainedExperts(_Cfg(), quantization_config=Fp8Config(weight_block_size=(16, 16)))
+        kernel = mock.Mock()
+        kernel.get_supported_act_fns.return_value = ("silu",)
+        kernel.get_supported_norms.return_value = ()
+        first = experts._moe_operands(kernel)
+        self.assertEqual(first["act_fn"], "silu")
+        experts.down_proj = torch.nn.Parameter(torch.empty_like(experts.down_proj), requires_grad=False)
+        second = experts._moe_operands(kernel)
+        self.assertIs(second["down_proj"], experts.down_proj)
+        self.assertIsNot(second["down_proj"], first["down_proj"])
+        kernel.get_supported_act_fns.assert_called_once()
+
+    def test_eager_gated_block_scales_pair_each_half_with_its_own_blocks(self):
+        """The loader interleaves a gate|up block grid per BLOCK, so one scale covers rows of one half while
+        the rows alternate between halves: the eager loop runs each half on its own rows and blocks rather
+        than hand `matmul_2d` the stack as a row-major grid. Halves of very different magnitudes, as real
+        gate and up projections have, so a scale read from the wrong half shows."""
+        experts = FineGrainedExperts(_Cfg(), quantization_config=Fp8Config(weight_block_size=(32, 32)))
+        experts._deepgemm_disabled = True
+        num_experts, hidden, inter = _Cfg.num_local_experts, _Cfg.hidden_size, _Cfg.intermediate_size
+        torch.manual_seed(0)
+        codes = torch.randn(num_experts, 2, inter, hidden).to(torch.float8_e4m3fn)  # [gate, up]
+        exponents = torch.tensor([-8.0, 0.0]).reshape(1, 2, 1, 1) + torch.randint(-2, 3, (num_experts, 2, 1, 2))
+        grid = torch.pow(2.0, exponents)  # (experts, half, row blocks, column blocks)
+        # interleaved: rows [g0, u0, g1, u1, ...], grid rows [gate block, up block]
+        experts.gate_up_proj = torch.nn.Parameter(codes.transpose(1, 2).reshape(num_experts, 2 * inter, hidden))
+        experts.gate_up_proj_scale_inv = torch.nn.Parameter(grid.transpose(1, 2).reshape(num_experts, 2, 2))
+
+        kernel, _ = fake_finegrained_kernel()
+        kernel.matmul_2d = _block_scaled_matmul_2d
+        x = torch.randn(3, hidden)
+        with patch_finegrained_kernel(kernel):
+            out = experts.expert_linear(x, "gate_up_proj", 1)
+        halves = [
+            x @ (codes[1, half].float() * grid[1, half].repeat_interleave(32, 0).repeat_interleave(32, 1)).T
+            for half in (0, 1)
+        ]
+        torch.testing.assert_close(out, torch.stack(halves, dim=-1).flatten(-2))
+
+    def test_eager_gated_per_tensor_scale_is_shared_by_gate_and_up(self):
+        experts = FineGrainedExperts(_Cfg(), quantization_config=Fp8Config(weight_block_size=None))
+        experts._deepgemm_disabled = True
+        torch.manual_seed(0)
+        codes = torch.randn_like(experts.gate_up_proj, dtype=torch.float32).to(torch.float8_e4m3fn)
+        experts.gate_up_proj = torch.nn.Parameter(codes)
+        # On-the-fly quantization of a fused projection produces one scale per expert,
+        # whereas separately calibrated gate/up checkpoints can hold two.
+        scales = torch.tensor([0.125, 0.5, 2.0, 8.0]).view(-1, 1, 1)
+        experts.gate_up_proj_scale_inv = torch.nn.Parameter(scales)
+        kernel, _ = fake_finegrained_kernel()
+        kernel.matmul_2d = _block_scaled_matmul_2d
+        x = torch.randn(3, _Cfg.hidden_size)
+        with patch_finegrained_kernel(kernel):
+            for expert in range(_Cfg.num_local_experts):
+                with self.subTest(expert=expert):
+                    actual = experts.expert_linear(x, "gate_up_proj", expert)
+                    expected = x @ (codes[expert].float() * scales[expert]).T
+                    torch.testing.assert_close(actual, expected)
+
+    def test_stacked_gate_up_is_gated_by_halves_and_kept_from_the_triton_chains(self):
+        """The DeepGEMM backends load gate|up stacked: the host GLU splits the halves, and a switch to the triton
+        chains, which read the rows interleaved, is refused rather than pair the wrong rows."""
+        config = _Cfg()
+        config._experts_implementation = "deepgemm"
+        experts = FineGrainedExperts(config, quantization_config=Fp8Config(weight_block_size=(32, 32)))
+        self.assertFalse(experts.holds_interleaved_gate_up)
+        gate, up = torch.randn(3, _Cfg.intermediate_size), torch.randn(3, _Cfg.intermediate_size)
+        torch.testing.assert_close(
+            experts._apply_gate(torch.cat([gate, up], dim=-1)), torch.nn.functional.silu(gate) * up
+        )
+
+        for implementation in ("grouped_mm", "batched_mm"):
+            with self.subTest(implementation), self.assertRaisesRegex(NotImplementedError, "interleaved"):
+                check_experts_weight_layout(experts, implementation)
+        for implementation in ("deepgemm", "eager"):
+            check_experts_weight_layout(experts, implementation)
+
+    def test_a_model_refuses_a_switch_to_a_backend_reading_another_layout(self):
+        """`set_experts_implementation` asks every experts module before switching anything, with the implementation
+        its own config gets (a dict names it per sub-config), so a refused switch leaves the model as it was."""
+        from transformers import AutoModelForCausalLM, Qwen2MoeConfig
+
+        config = _tiny_config(Qwen2MoeConfig, intermediate_size=32, experts_implementation="deepgemm")
+        model = AutoModelForCausalLM.from_config(config)
+        mlp = model.model.layers[0].mlp
+        mlp.experts = FineGrainedExperts.from_module(mlp.experts, Fp8Config(weight_block_size=(32, 32)), model)
+        for implementation in ("grouped_mm", {"": "batched_mm"}):
+            with self.subTest(implementation), self.assertRaisesRegex(NotImplementedError, "interleaved"):
+                model.set_experts_implementation(implementation)
+            self.assertEqual(model.config._experts_implementation, "deepgemm")
+        model.set_experts_implementation("eager")
+        self.assertEqual(model.config._experts_implementation, "eager")
+
+    def test_swiglu_alpha_without_a_limit_runs_unclamped(self):
+        config = _Cfg()
+        config.swiglu_alpha = 1.702
+        experts = FineGrainedExperts(config, quantization_config=Fp8Config(weight_block_size=(32, 32)))
+        gate_up = torch.randn(3, 2 * _Cfg.intermediate_size)
+        gate, up = gate_up[..., 0::2], gate_up[..., 1::2]
+        torch.testing.assert_close(experts._apply_gate(gate_up), (up + 1) * gate * torch.sigmoid(gate * 1.702))
+
+    def test_grouped_linear_broadcasts_a_shared_per_tensor_scale(self):
+        from transformers.integrations.finegrained import FineGrainedGroupedLinear
+
+        linear = FineGrainedGroupedLinear(
+            8, 12, 3, quantization_config=Fp8Config(weight_block_size=None), has_bias=True
+        )
+        torch.manual_seed(0)
+        linear.weight = torch.nn.Parameter(torch.randn(12, 8).to(torch.float8_e4m3fn))
+        linear.weight_scale_inv.data.fill_(0.25)
+        linear.bias.data.copy_(torch.randn(12))
+        kernel, _ = fake_finegrained_kernel()
+
+        def grouped_matmul(a, b, activation_scale, scales, *, expert_start, **kwargs):
+            self.assertEqual(expert_start.tolist(), [0, 10, 20, 30, 30])
+            return torch.cat(
+                [
+                    _block_scaled_matmul_2d(
+                        a[expert_start[group] : expert_start[group + 1]], b[group], None, scales[group]
+                    )
+                    for group in range(3)
+                ]
+            )
+
+        kernel.matmul_grouped = grouped_matmul
+        x = torch.randn(2, 5, 3, 8)
+        with patch_finegrained_kernel(kernel):
+            actual = linear(x)
+        weight = linear.weight.float().view(3, 4, 8) * 0.25
+        expected = torch.einsum("...gk,gnk->...gn", x, weight) + linear.bias.view(3, 4)
+        torch.testing.assert_close(actual, expected)
+
+
+@require_torch
+class FineGrainedFusedNormTest(unittest.TestCase):
+    """A post-expert norm the kernels implement rides by name, with the weight and epsilon the fused form needs."""
+
+    def _operands(self, norm):
+        experts = FineGrainedExperts(_Cfg(), quantization_config=_format_config("fp8", weight_block_size=(4, 4)))
+        experts.post_expert_norm, experts.has_post_expert_norm = norm, True
+        kernel = mock.Mock()
+        kernel.get_supported_act_fns.return_value = ("silu",)
+        kernel.get_supported_norms.return_value = ("rms_norm", "input_scaled_rms_norm")
+        return experts._moe_operands(kernel)
+
+
+class FineGrainedParallelPlanTest(unittest.TestCase):
+    """Update the built model's TP/EP plans without mutating config plans."""
+
+    def test_an_embedding_tables_scale_is_replicated(self):
+        config = Fp8Config(modules_to_convert=["table"])
+        quantizer = _quantizer_for(config)
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_experts_implementation=None)
+        model.table = fg.FineGrainedEmbedding.from_module(torch.nn.Embedding(8, 64), config, model)
+        for style in ("embedding_colwise", "replicate"):
+            with self.subTest(style=style):
+                plan = {"table": style}
+                quantizer.update_parallel_plan(model, plan)
+                self.assertEqual(plan["table.weight_scale"], "replicate")
+
+    def test_a_multimodal_models_expert_plans_are_reached(self):
+        from transformers.quantizers.quantizer_fp8 import Fp8HfQuantizer
+
+        from .utils import _conversion_model
+
+        quantizer = Fp8HfQuantizer(Fp8Config())
+        text_model = _conversion_model(quantizer)
+        model = torch.nn.Module()
+        model.config = SimpleNamespace(_experts_implementation=None)
+        model.language_model = text_model
+        plan = {"language_model.model.layers.*.mlp.experts.gate_up_proj": "grouped_gemm"}
+        quantizer.update_parallel_plan(model, plan)
+        self.assertEqual(plan["language_model.model.layers.*.mlp.experts.gate_up_proj_scale_inv"], "grouped_gemm")
+        self.assertFalse(text_model.config.base_model_ep_plan)
+
+    def test_a_real_models_plan_keeps_its_entries_and_gains_the_expert_companions(self):
+        from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3MoeConfig
+        from transformers.quantizers.quantizer_fp8 import Fp8HfQuantizer
+
+        for config_cls in (Qwen3Config, Qwen3MoeConfig):
+            with self.subTest(config=config_cls.__name__), torch.device("meta"):
+                config = _tiny_config(config_cls)
+                shipped = dict(config.base_model_tp_plan)
+                model = AutoModelForCausalLM.from_config(config)
+                before = dict(model.tp_plan)
+                quantizer = Fp8HfQuantizer(Fp8Config())
+                quantizer.preprocess_model(model)
+                for key, style in before.items():
+                    self.assertEqual(model.tp_plan[key], style, key)
+                self.assertEqual(config.base_model_tp_plan, shipped)
+        for companion in ("gate_up_proj_scale_inv", "down_proj_scale_inv"):
+            self.assertIn(f"model.layers.*.mlp.experts.{companion}", model.tp_plan)

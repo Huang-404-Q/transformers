@@ -17,9 +17,11 @@ own format's quantizer."""
 import re
 from typing import TYPE_CHECKING
 
+from ..utils.quantization_config import Fp8Config
 from .block_scaled_utils import BlockScaledQuantizer
 from .quantizers_utils import (
     checkpoint_module_namer,
+    embedding_pattern,
     get_module_from_name,
     module_kind,
     plan_entry_for,
@@ -42,6 +44,8 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
         super().__init__(quantization_config, **kwargs)
         from .auto import AUTO_QUANTIZER_MAPPING
 
+        # the embedding tables `modules_to_convert` names hold FP8 rows with one per-tensor scale
+        self._embedding_config = Fp8Config(weight_block_size=None)
         self._resolved_plan = None
         # equal entries share one config, so a per-layer export builds one member per format
         shared = {}
@@ -52,9 +56,14 @@ class FineGrainedHfQuantizer(BlockScaledQuantizer):
         configs = {id(config): config for config in self.plan().values()}.values()
         self._members = [AUTO_QUANTIZER_MAPPING[config.method.value](config, **kwargs) for config in configs]
         self._member_by_config = {id(member.quantization_config): member for member in self._members}
+        for member in self._members:
+            member.embeddings = self.embeddings
 
     def plan(self):
-        return self.quantization_config.dtype_plan if self._resolved_plan is None else self._resolved_plan
+        return {
+            **dict.fromkeys(map(embedding_pattern, self.embeddings), self._embedding_config),
+            **(self.quantization_config.dtype_plan if self._resolved_plan is None else self._resolved_plan),
+        }
 
     def _process_model_before_weight_loading(self, model: "PreTrainedModel", **kwargs):
         # the plan's patterns may name the checkpoint's modules, which the saved config keeps

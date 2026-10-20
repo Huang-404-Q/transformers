@@ -28,7 +28,7 @@ from ...activations import ACT2FN
 from ...quantizers.quantizers_utils import FUSED_STACKS
 from ...utils import logging
 from ...utils.import_utils import is_kernels_available
-from ...utils.quantization_config import BlockScaledConfig
+from ...utils.quantization_config import BlockScaledConfig, Fp8Config
 from ..deepgemm import (
     deepgemm_fp8_fp4_experts_forward,
     deepgemm_fp8_fp4_linear,
@@ -38,7 +38,7 @@ from ..deepgemm import (
 )
 from ..hub_kernels import _MISSING_KERNELS_MESSAGE, lazy_load_kernel
 from ..moe import ExpertsInterface, use_experts_implementation
-from .formats import WeightFormat, cdiv, resolve_weight_format
+from .formats import FP8_DTYPE, WeightFormat, cdiv, resolve_weight_format
 
 
 logger = logging.get_logger(__name__)
@@ -272,12 +272,12 @@ class FineGrainedLinear(_FineGrainedModule, nn.Linear):
         in_features: int,
         out_features: int,
         *,
-        quantization_config: BlockScaledConfig,
+        quantization_config: BlockScaledConfig | None = None,
         has_bias: bool = False,
     ):
         super().__init__(in_features, out_features)
 
-        self.quantization_config = quantization_config
+        self.quantization_config = quantization_config or Fp8Config(weight_block_size=None)
         self.has_bias = has_bias
 
         format_spec, sf_dtype, scale_group = resolve_weight_format(
@@ -335,6 +335,56 @@ class FineGrainedLinear(_FineGrainedModule, nn.Linear):
         )
 
 
+class FineGrainedEmbedding(_FineGrainedModule, nn.Embedding):
+    """An embedding table stored in FP8 with one per-tensor `weight_scale`, rescaled on the rows a lookup gathers, for
+    tables too big to dequantize."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: int | None = None,
+        *,
+        quantization_config: BlockScaledConfig | None = None,
+    ):
+        nn.Module.__init__(self)
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        if padding_idx is not None:
+            if not -num_embeddings <= padding_idx < num_embeddings:
+                raise ValueError("padding_idx must be within num_embeddings.")
+            padding_idx %= num_embeddings
+        self.padding_idx = padding_idx
+        self.max_norm = None
+        self.norm_type = 2.0
+        self.scale_grad_by_freq = False
+        self.sparse = False
+        self.quantization_config = quantization_config or Fp8Config(weight_block_size=None)
+        # a block-FP8 config names its tables in `modules_to_convert`, which still take one scale each
+        if self.weight_format != "fp8" or (
+            self.quantization_config.weight_block_size is not None and not self.quantization_config.modules_to_convert
+        ):
+            raise ValueError("Fine-grained embeddings hold per-tensor FP8 tables.")
+        self.weight = nn.Parameter(torch.empty(num_embeddings, embedding_dim, dtype=FP8_DTYPE), requires_grad=False)
+        # `(1,)` rather than a scalar: the shape checkpoints serialize per-tensor scales with
+        self.weight_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+
+    @classmethod
+    def from_module(
+        cls, module: nn.Embedding, quantization_config: BlockScaledConfig, model: nn.Module
+    ) -> FineGrainedEmbedding:
+        return cls(
+            module.num_embeddings,
+            module.embedding_dim,
+            module.padding_idx,
+            quantization_config=quantization_config,
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        rows = super().forward(input)
+        return rows.to(self.weight_scale.dtype) * self.weight_scale
+
+
 class FineGrainedGroupedLinear(FineGrainedLinear):
     """Quantized block-diagonal grouped linear: `n_groups` sub-matrices stacked in one `(n_groups * out_per_group,
     in_per_group)` weight, each run on every token's own group. Takes `(..., n_groups, in_per_group)` and returns
@@ -346,7 +396,7 @@ class FineGrainedGroupedLinear(FineGrainedLinear):
         out_features: int,
         n_groups: int,
         *,
-        quantization_config: BlockScaledConfig,
+        quantization_config: BlockScaledConfig | None = None,
         has_bias: bool = False,
     ):
         super().__init__(
@@ -469,7 +519,7 @@ class FineGrainedExperts(_FineGrainedModule, nn.Module):
         self,
         config,
         *,
-        quantization_config: BlockScaledConfig,
+        quantization_config: BlockScaledConfig | None = None,
         has_gate: bool = True,
         has_bias: bool = False,
         is_concatenated: bool = True,
@@ -488,7 +538,7 @@ class FineGrainedExperts(_FineGrainedModule, nn.Module):
         self.intermediate_dim = _first_attr(config, "moe_intermediate_size", "intermediate_size")
         self.act_fn = ACT2FN[self.act_fn_name]
 
-        self.quantization_config = quantization_config
+        self.quantization_config = quantization_config or Fp8Config(weight_block_size=None)
         activation_format = self.activation_format
         format_spec, scale_dtype, scale_group = resolve_weight_format(
             self.weight_format, self.quantization_config.scale_fmt, self.block_size

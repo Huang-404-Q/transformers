@@ -28,6 +28,7 @@ from .base import HfQuantizer
 from .quantizers_utils import (
     FUSED_STACKS,
     STACK_COMPANIONS,
+    embedding_pattern,
     get_module_from_name,
     replace_with_quantized_modules,
 )
@@ -67,6 +68,11 @@ class BlockScaledQuantizer(HfQuantizer):
     unexpected_keys: tuple[str, ...] = ()
     # by `checkpoint_format`: how each producer ships this format, the slots' own layout where none is listed
     producer_layouts: dict[str | None, ProducerLayout] = {}
+
+    def __init__(self, quantization_config, **kwargs):
+        super().__init__(quantization_config, **kwargs)
+        # the embedding tables the plan quantizes, by name suffix: each holds its own per-tensor `weight_scale`
+        self.embeddings = list(getattr(quantization_config, "modules_to_convert", None) or [])
 
     def plan(self) -> dict[str, "BlockScaledConfig"]:
         """`{module regex: format config}` for the modules this quantizer covers."""
@@ -173,11 +179,12 @@ class BlockScaledQuantizer(HfQuantizer):
         return [f"experts.*.{half}.{slot}" for half in halves]
 
     def _block_scale_rename(self):
-        """Rename block scales onto their slot."""
+        """Rename block scales while leaving the host's scalar embedding scales untouched."""
         from ..core_model_loading import WeightRenaming
 
+        kept = "".join(rf"(?<!{re.escape(name)})" for name in self.embeddings)
         shipped = self.producer_layout.block_scale_name
-        return WeightRenaming(source_patterns=rf"^(.+)\.{shipped}", target_patterns=r"\1.weight_scale_inv")
+        return WeightRenaming(source_patterns=rf"^(.+){kept}\.{shipped}", target_patterns=r"\1.weight_scale_inv")
 
     def _activation_scale_conversions(self, up_projections, projections=FUSED_STACKS, ops=()) -> list:
         """A calibrated `input_scale` onto the module's `activation_scale`: renamed, then reduced to one per expert
@@ -293,12 +300,32 @@ class BlockScaledQuantizer(HfQuantizer):
         return super().get_new_dtype(converter, param, dtype)
 
     def _process_model_before_weight_loading(self, model: "PreTrainedModel", **kwargs):
+        from ..integrations.finegrained import FineGrainedEmbedding
+
         self.modules_to_not_convert = self.get_modules_to_not_convert(
             model, self.quantization_config.modules_to_not_convert, model._keep_in_fp32_modules
         )
-        # a dequantized load keeps every module as it is
-        plan = {} if self.pre_quantized and self.quantization_config.dequantize else self.plan()
+        # an embedding table worth quantizing is too big to expand, so it stays FP8 under `dequantize=True`
+        # too; quantizing one on the fly has no path
+        plan = self.plan()
+        embeddings = set(map(embedding_pattern, self.embeddings))
+        if not self.pre_quantized:
+            plan = {pattern: config for pattern, config in plan.items() if pattern not in embeddings}
+        elif self.quantization_config.dequantize:
+            plan = {pattern: config for pattern, config in plan.items() if pattern in embeddings}
         replaced = self.replace_modules(model, plan, self.modules_to_not_convert)
+
+        # an FP8 table kept off the device map keeps its scale with it
+        if excluded := getattr(model, "_no_placement_params", None):
+            excluded = set(excluded)
+            for name, module in model.named_modules():
+                if isinstance(module, FineGrainedEmbedding):
+                    excluded.update(
+                        entry.removesuffix("weight") + "weight_scale"
+                        for entry in list(excluded)
+                        if entry.endswith(".weight") and f"{name}.weight".endswith(entry)
+                    )
+            model._no_placement_params = sorted(excluded)
 
         ignored = set(model._keys_to_ignore_on_load_unexpected or [])
         for member in self.members():
@@ -316,12 +343,18 @@ class BlockScaledQuantizer(HfQuantizer):
 
     def replace_modules(self, model, plan=None, modules_to_not_convert=None) -> bool:
         """Swap the modules `plan` (this quantizer's own by default) covers for their quantized classes."""
-        from ..integrations.finegrained import FineGrainedExperts, FineGrainedGroupedLinear, FineGrainedLinear
+        from ..integrations.finegrained import (
+            FineGrainedEmbedding,
+            FineGrainedExperts,
+            FineGrainedGroupedLinear,
+            FineGrainedLinear,
+        )
 
         module_classes = {
             "linear": FineGrainedLinear,
             "grouped_linear": FineGrainedGroupedLinear,
             "experts": FineGrainedExperts,
+            "embedding": FineGrainedEmbedding,
         }
         plan = self.plan() if plan is None else plan
         return replace_with_quantized_modules(model, plan, modules_to_not_convert, module_classes)

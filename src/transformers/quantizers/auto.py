@@ -32,6 +32,7 @@ from ..utils.quantization_config import (
     FineGrainedConfig,
     FineGrainedFP8Config,
     FourOverSixConfig,
+    Fp8Config,
     FPQuantConfig,
     GemmaQuantizationConfig,
     GgufConfig,
@@ -49,6 +50,8 @@ from ..utils.quantization_config import (
     SpQRConfig,
     TorchAoConfig,
     VptqConfig,
+    read_compressed_tensors,
+    read_modelopt,
 )
 from .base import HfQuantizer
 from .quantizer_aqlm import AqlmHfQuantizer
@@ -63,6 +66,7 @@ from .quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
 from .quantizer_finegrained import FineGrainedHfQuantizer
 from .quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from .quantizer_fouroversix import FourOverSixHfQuantizer
+from .quantizer_fp8 import Fp8HfQuantizer
 from .quantizer_fp_quant import FPQuantHfQuantizer
 from .quantizer_gemma import GemmaQuantizer
 from .quantizer_gguf import GgufHfQuantizer
@@ -103,7 +107,7 @@ AUTO_QUANTIZER_MAPPING = {
     "metal": MetalHfQuantizer,
     "auto-round": AutoRoundQuantizer,
     # fine-grained: one quantizer per weight format, and one hosting several on the parts of a model
-    "fp8": FineGrainedFP8HfQuantizer,
+    "fp8": Fp8HfQuantizer,
     "mxfp8": FineGrainedFP8HfQuantizer,
     "mxfp4": Mxfp4HfQuantizer,
     "nvfp4": NVFP4HfQuantizer,
@@ -134,7 +138,7 @@ AUTO_QUANTIZATION_CONFIG_MAPPING = {
     "spqr": SpQRConfig,
     "metal": MetalConfig,
     "auto-round": AutoRoundConfig,
-    "fp8": FineGrainedFP8Config,
+    "fp8": Fp8Config,
     "mxfp8": FineGrainedFP8Config,
     "mxfp4": Mxfp4Config,
     "nvfp4": NVFP4Config,
@@ -145,10 +149,14 @@ AUTO_QUANTIZATION_CONFIG_MAPPING = {
 
 # Readers of checkpoints another tool wrote, by their `quant_method`: each returns the config the checkpoint describes,
 # or `None` to leave it to the method's own config class
-AUTO_QUANTIZATION_CONFIG_READERS: dict[str, Callable[[dict], QuantizationConfigMixin | None]] = {}
+AUTO_QUANTIZATION_CONFIG_READERS: dict[str, Callable[[dict], QuantizationConfigMixin | None]] = {
+    "modelopt": read_modelopt,
+    "compressed-tensors": read_compressed_tensors,
+}
 
-# a passed config of these types reads a pre-quantized checkpoint's config as its own
-CHECKPOINT_READING_CONFIG_TYPES = (AutoRoundConfig,)
+# a passed config of these types reads a pre-quantized checkpoint's config as its own; the deprecated
+# `FineGrainedFP8Config` so keeps loading through its frozen integration
+CHECKPOINT_READING_CONFIG_TYPES = (AutoRoundConfig, CompressedTensorsConfig, FineGrainedFP8Config)
 
 LOADING_ATTRIBUTES_CONFIG_TYPES = (
     GPTQConfig,
@@ -222,6 +230,9 @@ class AutoHfQuantizer:
         # Convert it to a QuantizationConfig if the q_config is a dict
         if isinstance(quantization_config, dict):
             quantization_config = AutoQuantizationConfig.from_dict(quantization_config)
+        # the deprecated config keeps its own, frozen integration
+        if isinstance(quantization_config, FineGrainedFP8Config):
+            return FineGrainedFP8HfQuantizer(quantization_config, **kwargs)
 
         quant_method = quantization_config.quant_method
 

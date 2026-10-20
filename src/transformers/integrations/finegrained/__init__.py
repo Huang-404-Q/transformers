@@ -17,6 +17,7 @@ is imported by path, so that reading a checkpoint's layout never drags the kerne
 
 from .layers import (
     ALL_FINEGRAINED_EXPERTS_FUNCTIONS,
+    FineGrainedEmbedding,
     FineGrainedExperts,
     FineGrainedGroupedLinear,
     FineGrainedLinear,
@@ -29,6 +30,7 @@ from .layers import (
 
 __all__ = [
     "ALL_FINEGRAINED_EXPERTS_FUNCTIONS",
+    "FineGrainedEmbedding",
     "FineGrainedExperts",
     "FineGrainedGroupedLinear",
     "FineGrainedLinear",
