@@ -70,10 +70,6 @@ Learn how to quantize models in the [Quantization](../quantization/overview) gui
 
 [[autodoc]] MetalConfig
 
-## NVFP4Config
-
-[[autodoc]] NVFP4Config
-
 ## FbgemmFp8Config
 
 [[autodoc]] FbgemmFp8Config
@@ -107,6 +103,10 @@ The base class of the block-scaled format configs below; build one of them inste
 ## Mxfp4Config
 
 [[autodoc]] Mxfp4Config
+
+## NVFP4Config
+
+[[autodoc]] NVFP4Config
 
 ## FineGrainedConfig
 

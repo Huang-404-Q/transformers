@@ -16,7 +16,7 @@ rendered properly in your Markdown viewer.
 
 # Fine-grained
 
-[FP8](./fp8) and [MXFP4](./mxfp4) are block-scaled formats: low-precision
+[FP8](./fp8), [MXFP4](./mxfp4) and [NVFP4](./nvfp4) are block-scaled formats: low-precision
 weights with one scale per block or group of values. They share one integration and one kernel bundle,
 [finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels), and each has its own config that
 quantizes a whole model. [`FineGrainedConfig`] mixes them in one model. This page covers what they share; the format
@@ -92,6 +92,28 @@ These checkpoints load as a [`FineGrainedConfig`] without one being passed:
 - DeepSeek-V4 ships block-FP8 weights with MXFP4 routed experts. Its checkpoint declares `quant_method="fp8"` and its
   model config `expert_dtype="fp4"` (DeepSeek-V4.1 declares it in its quantization config), which together read as a
   plan of MXFP4 experts over block FP8. See [DeepSeek-V4](../model_doc/deepseek_v4) for the plan written out.
+- A ModelOpt export labelled `quant_algo="NVFP4"` whose `config_groups` give different modules different formats
+  reads as a plan with one entry per group target.
+- ModelOpt `quant_algo="MIXED_PRECISION"` reads its `quantized_layers` mapping. Each module name covers that module
+  and its descendants, and modules absent from the mapping stay in full precision. The supported algorithms are `FP8`
+  (calibrated per-tensor FP8), `NVFP4`, `MXFP4`, and the
+  `W4A16_NVFP4` / `W4A16_MXFP4` weight-only variants.
+
+```json
+{
+  "quant_method": "modelopt",
+  "quant_algo": "MIXED_PRECISION",
+  "quantized_layers": {
+    "layers.8.attention.wq": {"quant_algo": "FP8"},
+    "layers.9.experts": {"quant_algo": "NVFP4", "group_size": 16}
+  }
+}
+```
+
+Module names resolve through the model's checkpoint renames. An assignment that matches no supported linear, expert,
+or embedding module raises an error, as does a per-expert assignment the model's fused expert module cannot hold.
+Unsupported algorithms and config groups, AWQ smoothing (`pre_quant_scale`), SVD residuals, asymmetric zero points,
+sparse or transformed layouts, and compressed scale encodings such as `weight_scale_encoding="csf"` raise an error too.
 
 ## Tensor and expert parallelism
 
