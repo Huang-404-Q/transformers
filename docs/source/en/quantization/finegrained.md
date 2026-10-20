@@ -16,7 +16,7 @@ rendered properly in your Markdown viewer.
 
 # Fine-grained
 
-The block-scaled formats are low-precision
+The block-scaled formats, [FP8](./fp8) among them, are low-precision
 weights with one scale per block or group of values. They share one integration and one kernel bundle,
 [finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels), and each has its own config that
 quantizes a whole model. [`FineGrainedConfig`] mixes them in one model. This page covers what they share; the format
@@ -40,6 +40,15 @@ pip install --upgrade accelerate "kernels>=0.17.2,<0.18"
 A pre-quantized checkpoint carries its quantization config, so it loads with no config. Pass a format config to
 [`~PreTrainedModel.from_pretrained`] to quantize a full-precision checkpoint as it loads, and save it with
 [`~PreTrainedModel.save_pretrained`]; the saved model reloads with no config.
+
+```py
+from transformers import AutoModelForCausalLM, Fp8Config
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B", dtype="auto", device_map="auto", quantization_config=Fp8Config()
+)
+model.save_pretrained("qwen3-8b-fp8")
+```
 
 A config passed with a pre-quantized checkpoint does not requantize it. Its `activation_format` picks the kernels the
 weights run on, and its loading options apply:
@@ -68,6 +77,15 @@ linear in 8 bits.
 Pass a [`DistributedConfig`] to [`~PreTrainedModel.from_pretrained`] to shard a quantized model; each
 scale is sharded with its weight. Quantized experts use [masking and all-reduce](../expert_parallelism) expert
 parallelism instead of token dispatch, so `ep_size` must equal `tp_size`.
+
+```py
+from transformers import AutoModelForCausalLM
+from transformers.distributed import DistributedConfig
+
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-30B-A3B-FP8", dtype="auto", distributed_config=DistributedConfig(tp_size=8, ep_size=8)
+)
+```
 
 ## Kernel autotuning
 
