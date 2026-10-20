@@ -35,6 +35,7 @@ from transformers.modeling_utils import LoadStateDictConfig
 from transformers.testing_utils import require_torch
 from transformers.utils.quantization_config import (
     Fp8Config,
+    NVFP4Config,
 )
 
 from .utils import (
@@ -157,11 +158,84 @@ class FineGrainedLayoutOpsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             FineGrainedViewPackedInt8(None).convert({"x": [tensor, tensor]}, target_patterns=["experts.down_proj"])
 
+    def test_per_half_globals_are_not_folded_past_a_glu_nonlinear_in_up(self):
+        """Folding the up half's NVFP4 global onto the down projection assumes the GLU is linear in `up`; a
+        clamped SwiGLU or SwiGLU-OAI's `(up + 1)` is not, so differing halves are refused there. Halves that
+        agree have nothing to fold."""
+        from transformers.integrations.finegrained.conversions import FineGrainedWeightGlobals
+
+        targets = ["experts.gate_up_proj_weight_global_scale", "experts.down_proj_weight_global_scale"]
+        for attribute in ("swiglu_limit", "swiglu_alpha"):
+            config = _Cfg()
+            setattr(config, attribute, 7.0)
+            model = torch.nn.Module()
+            model.experts = fg.FineGrainedExperts(config, quantization_config=NVFP4Config())
+            with self.subTest(attribute=attribute):
+                with self.assertRaises(NotImplementedError):
+                    FineGrainedWeightGlobals().convert(
+                        {
+                            "experts.gate_up_proj_weight_scale_2": torch.tensor([[1.0, 3.0], [2.0, 4.0]]),
+                            "experts.down_proj_weight_scale_2": torch.tensor([5.0, 6.0]),
+                        },
+                        target_patterns=targets,
+                        model=model,
+                    )
+                out = FineGrainedWeightGlobals().convert(
+                    {
+                        "experts.gate_up_proj_weight_scale_2": torch.tensor([[1.0, 1.0], [2.0, 2.0]]),
+                        "experts.down_proj_weight_scale_2": torch.tensor([5.0, 6.0]),
+                    },
+                    target_patterns=targets,
+                    model=model,
+                )
+                torch.testing.assert_close(out[targets[0]], torch.tensor([1.0, 2.0]))
+                torch.testing.assert_close(out[targets[1]], torch.tensor([5.0, 6.0]))
+
 
 @require_torch
 class FineGrainedLoaderChainTest(unittest.TestCase):
     """A core conversion chain and an on-the-fly quantization in the same load: the permute has to
     run on the full-precision tensor, and only the finegrained module of the three gets a scale."""
+
+    def test_dequantizing_a_fused_nvfp4_stack_applies_each_experts_globals(self):
+        """The vLLM layout ships each stack's globals per expert, `(E,)`, and a gate|up stack's per half,
+        `(E, 2)`: the stack's dequantize scales each expert's rows, and each half's, by its own."""
+        from transformers.integrations.finegrained.conversions import FineGrainedDequantize
+
+        torch.manual_seed(0)
+        checkpoint, expected = {}, {}
+        for proj, rows, cols, halves in (("gate_up_proj", 2 * I, H, 2), ("down_proj", H, I, 1)):
+            codes = torch.randint(0, 256, (E, rows, cols // 2), dtype=torch.uint8)
+            blocks = (torch.rand(E, rows, cols // 16) + 0.5).to(torch.float8_e4m3fn)
+            globals_ = torch.pow(2.0, torch.randint(-8, 0, (E, halves)).float())
+            prefix = f"model.layers.0.mlp.experts.{proj}"
+            checkpoint |= {
+                prefix: codes,
+                f"{prefix}_weight_scale": blocks,
+                f"{prefix}_weight_scale_2": globals_.squeeze(1) if halves == 1 else globals_,
+            }
+            half_rows = rows // halves
+            expected[proj] = torch.stack(
+                [
+                    torch.cat(
+                        [
+                            FineGrainedDequantize(None)._dequantize_one(
+                                codes[e, h * half_rows : (h + 1) * half_rows],
+                                blocks[e, h * half_rows : (h + 1) * half_rows],
+                                torch.float32,
+                                globals_[e, h],
+                            )
+                            for h in range(halves)
+                        ]
+                    )
+                    for e in range(E)
+                ]
+            )
+        model, info, _ = _load_and_save(checkpoint, NVFP4Config(dequantize=True))
+        self.assertEqual(info.conversion_errors, {})
+        experts = model.model.layers[0].mlp.experts
+        for proj, reference in expected.items():
+            torch.testing.assert_close(getattr(experts, proj).float(), reference, msg=proj)
 
     def test_on_the_fly_quantization_blocks_each_projection_whole(self):
         """The gate|up interleave runs on the quantized weight and its grid, so every 32-row block holds rows of

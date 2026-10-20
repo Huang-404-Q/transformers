@@ -15,16 +15,128 @@
 
 import unittest
 
+import torch
+from parameterized import parameterized
+
 from transformers.quantizers.auto import AutoQuantizationConfig
 from transformers.testing_utils import require_torch
-from transformers.utils.quantization_config import NVFP4Config, read_compressed_tensors
+from transformers.utils.quantization_config import NVFP4Config, read_compressed_tensors, read_modelopt
 
-from ...integrations.finegrained.utils import _compressed_tensors
+from ...integrations.finegrained.utils import _compressed_tensors, _modelopt, _quantizer_for
 
 
 @require_torch
 class BlockScaledCheckpointReaderTest(unittest.TestCase):
     """modelopt and compressed-tensors NVFP4 exports read as `NVFP4Config`, skip-lists bounded to the modules they name."""
+
+    def test_a_producers_config_groups_are_normalized(self):
+        """modelopt describes a format by its parameters; we name it. GLM-5.2-NVFP4 ships exactly
+        this, and `targets: ["Linear"]` is its spelling of the catch-all, so the export is one format."""
+        config = _modelopt(
+            config_groups={
+                "group_0": {
+                    "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                    "input_activations": {"num_bits": 4, "type": "float", "group_size": 16, "dynamic": False},
+                    "targets": ["Linear"],
+                }
+            },
+        )
+        self.assertIsInstance(config, NVFP4Config)
+        self.assertIsNone(config.activation_format)
+        # NVFP4's `dynamic: False` is its calibrated activation global, not a static activation scale
+        self.assertEqual(config.activation_scheme, "dynamic")
+
+    def test_an_unsupported_modelopt_group_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported modelopt config_groups entry 'group_0'"):
+            _modelopt(
+                config_groups={
+                    "group_0": {"weights": {"num_bits": 3, "type": "int", "group_size": 64}, "targets": ["Linear"]}
+                },
+            )
+
+    def test_mixed_precision_maps_explicit_modules_and_leaves_others_unquantized(self):
+        from transformers.quantizers.quantizers_utils import plan_entry_for
+        from transformers.utils.quantization_config import FineGrainedConfig, Fp8Config
+
+        spec = {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "layers.8.attention.wq": {"quant_algo": "FP8"},
+                "layers.9.experts": {"quant_algo": "NVFP4", "group_size": 16},
+            },
+        }
+        for fields in (spec, {"quantization": spec}):
+            with self.subTest(nested="quantization" in fields):
+                config = AutoQuantizationConfig.from_dict({"quant_method": "modelopt", **fields})
+                self.assertIsInstance(config, FineGrainedConfig)
+                dense = plan_entry_for(config.dtype_plan, "model.layers.8.attention.wq")
+                self.assertIsInstance(dense, Fp8Config)
+                self.assertEqual(dense.activation_scheme, "static")
+                self.assertIsNone(dense.weight_block_size)
+                self.assertIsInstance(plan_entry_for(config.dtype_plan, "layers.9.experts.0.gate_proj"), NVFP4Config)
+                self.assertIsNone(plan_entry_for(config.dtype_plan, "layers.90.experts"))
+                self.assertIsNone(plan_entry_for(config.dtype_plan, "layers.8.attention.wk"))
+                restored = AutoQuantizationConfig.from_dict(config.to_dict())
+                self.assertEqual(restored.to_dict(), config.to_dict())
+
+    def test_mixed_precision_rejects_incomplete_or_unsupported_assignments(self):
+        for fields, message in (
+            ({}, "non-empty quantized_layers"),
+            ({"quantized_layers": {}}, "non-empty quantized_layers"),
+            ({"quantized_layers": {"layers.0": {"quant_algo": "W4A16_AWQ"}}}, "layers.0"),
+            ({"quantized_layers": {"layers.0": {"quant_algo": "NVFP4", "group_size": 32}}}, "group_size=16"),
+        ):
+            with self.subTest(fields=fields), self.assertRaisesRegex(ValueError, message):
+                AutoQuantizationConfig.from_dict(
+                    {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", **fields}
+                )
+
+    def test_modelopt_runtime_transforms_are_not_dropped(self):
+        from transformers.utils.quantization_config import read_compressed_tensors
+
+        nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16}
+        for field, value in (
+            ("pre_quant_scale", True),
+            ("lora_rank", 16),
+            ("has_zero_point", True),
+            ("weight_scale_encoding", "csf"),
+        ):
+            for placement in ("top", "group", "layer"):
+                with self.subTest(field=field, placement=placement), self.assertRaisesRegex(ValueError, field):
+                    if placement == "top":
+                        _modelopt(**{field: value})
+                    elif placement == "group":
+                        _modelopt(config_groups={"g": {"weights": nvfp4, field: value}})
+                    else:
+                        AutoQuantizationConfig.from_dict(
+                            {
+                                "quant_method": "modelopt",
+                                "quant_algo": "MIXED_PRECISION",
+                                "quantized_layers": {"layers.0": {"quant_algo": "NVFP4", field: value}},
+                            }
+                        )
+        # The compressed-tensors reader likewise must leave unsupported transforms to its own backend.
+        self.assertIsNone(read_compressed_tensors(_compressed_tensors(nvfp4, nvfp4, pre_quant_scale=True)))
+
+    def test_modelopt_groups_accept_exported_module_names(self):
+        from transformers.quantizers.quantizers_utils import plan_entry_for
+
+        config = _modelopt(
+            config_groups={
+                "g": {
+                    "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                    "targets": ["model.layers.0.mlp.experts"],
+                }
+            }
+        )
+        self.assertIsInstance(plan_entry_for(config.dtype_plan, "model.layers.0.mlp.experts"), NVFP4Config)
+        self.assertIsNone(plan_entry_for(config.dtype_plan, "model.layers.1.mlp.experts"))
+
+    def test_a_compressed_tensors_nvfp4_checkpoint_reads_as_nvfp4(self):
+        nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"}
+        config = AutoQuantizationConfig.from_dict(_compressed_tensors(nvfp4, nvfp4, ignore=["lm_head"]))
+        self.assertIsInstance(config, NVFP4Config)
+        self.assertEqual(config.checkpoint_format, "compressed-tensors")
 
     def test_compressed_tensors_checkpoints_we_do_not_serve_stay_with_it(self):
         """Integer, per-channel FP8 and sparse checkpoints are compressed-tensors' own."""
@@ -39,6 +151,20 @@ class BlockScaledCheckpointReaderTest(unittest.TestCase):
             _compressed_tensors(nvfp4, sparsity_config={"format": "sparse-24-bitmask"}),
         ):
             self.assertIsNone(read_compressed_tensors(checkpoint))
+
+    def test_unrepresentable_modelopt_targets_raise_before_loading(self):
+        model = torch.nn.Module()
+        model.linear = torch.nn.Linear(16, 16)
+        for target in ("unknown", "experts.0.gate_proj"):
+            config = AutoQuantizationConfig.from_dict(
+                {
+                    "quant_method": "modelopt",
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {target: {"quant_algo": "NVFP4"}},
+                }
+            )
+            with self.subTest(target=target), self.assertRaisesRegex(ValueError, "matches no supported"):
+                _quantizer_for(config)._process_model_before_weight_loading(model)
 
 
 class QuantizationConfigReaderRegistryTest(unittest.TestCase):
@@ -73,6 +199,14 @@ class FineGrainedConfigGroupReaderTest(unittest.TestCase):
         groups = [("nvfp4", nvfp4), ("other", nvfp4 if identical else fp8)]
         return dict(reversed(groups) if reverse else groups)
 
+    def test_modelopt_rejects_conflicting_group_targets_in_either_order(self):
+        for reverse in (False, True):
+            with (
+                self.subTest(reverse=reverse),
+                self.assertRaisesRegex(ValueError, "Conflicting quantization configs for target"),
+            ):
+                read_modelopt({"quant_algo": "NVFP4", "config_groups": self._groups(reverse=reverse)})
+
     def test_compressed_tensors_keeps_its_backend_for_conflicting_group_targets(self):
         for reverse in (False, True):
             with self.subTest(reverse=reverse):
@@ -81,6 +215,17 @@ class FineGrainedConfigGroupReaderTest(unittest.TestCase):
                         {"format": "float-quantized", "config_groups": self._groups(reverse=reverse)}
                     )
                 )
+
+    def test_identical_group_targets_can_share_a_config(self):
+        for reverse in (False, True):
+            for reader, fields, checkpoint_format in (
+                (read_modelopt, {"quant_algo": "NVFP4"}, "modelopt"),
+                (read_compressed_tensors, {"format": "float-quantized"}, "compressed-tensors"),
+            ):
+                with self.subTest(reverse=reverse, producer=checkpoint_format):
+                    config = reader({**fields, "config_groups": self._groups(reverse=reverse, identical=True)})
+                    self.assertIsInstance(config, NVFP4Config)
+                    self.assertEqual(config.checkpoint_format, checkpoint_format)
 
 
 NVFP4 = {"num_bits": 4, "type": "float", "group_size": 16}
@@ -93,3 +238,51 @@ class ProducerSkipListTest(unittest.TestCase):
     subtree) or exact names and `re:` patterns (compressed-tensors): each skips exactly the modules it names.
     Passed through as regexes the dots match any character and the star is greedy, so "model.layers.1.*" would
     also take layers 10-19."""
+
+    @parameterized.expand(
+        [
+            (
+                "modelopt_globs",
+                {**MODELOPT, "exclude_modules": ["model.layers.*.self_attn", "*.shared_experts.*"]},
+                ["model.layers.0.self_attn.q_proj", "model.layers.12.self_attn", "model.layers.0.mlp.shared_experts.up_proj"],
+                ["model.layers.0.mlp.experts", "model.layers.0.my_self_attn", "modelXlayers.0.self_attn"],
+            ),
+            (
+                "modelopt_bounded_globs",
+                {**MODELOPT, "ignore": ["model.layers.0*", "model.layers.1.*", "self_attn"]},
+                ["model.layers.0.mlp", "model.layers.01.mlp", "model.layers.1.mlp.down_proj", "model.layers.2.self_attn.q_proj"],
+                ["model.layers.16.mlp.down_proj", "model.layers.2.mlp.gate_proj", "model.my_self_attn.q_proj"],
+            ),
+            (
+                "modelopt_trailing_separator",
+                {**MODELOPT, "exclude_modules": ["layers.0.", "layers.61.", "self_attn", "lm_head"]},
+                ["model.layers.0.mlp.experts", "model.layers.0", "model.layers.61.mlp.up_proj", "model.layers.61",
+                 "model.layers.3.self_attn.q_proj", "lm_head"],
+                ["model.layers.00.mlp.up_proj", "model.layers.610.mlp.up_proj", "model.layers.6.mlp.up_proj",
+                 "model.layers.1.mlp.up_proj"],
+            ),
+            (
+                "modelopt_merged_with_a_native_regex",
+                {**MODELOPT, "modules_to_not_convert": [r"^model\.audio_tower(?:\.|$)"],
+                 "ignore": ["model.visual_tower.*"], "exclude_modules": ["layers.0."]},
+                ["model.audio_tower.layers.1.proj", "model.visual_tower.layers.1.proj", "model.layers.0.mlp.up_proj"],
+                ["model.audio_tower_extra.proj", "model.visual_tower_extra.proj", "model.layers.00.mlp.up_proj"],
+            ),
+            (
+                "compressed_tensors_names_and_regexes",
+                _compressed_tensors(NVFP4, ignore=["model.layers.0.mlp.gate", "re:.*router$"]),
+                ["model.layers.0.mlp.gate", "model.layers.3.mlp.router"],
+                ["model.layers.0.mlp.gate_proj"],
+            ),
+        ]
+    )  # fmt: skip
+    def test_a_skip_list_names_exactly_its_modules(self, _, checkpoint, skipped, converted):
+        from transformers.quantizers.quantizers_utils import should_convert_module
+
+        config = AutoQuantizationConfig.from_dict(checkpoint)
+        for name in skipped:
+            self.assertFalse(should_convert_module(name, config.modules_to_not_convert), name)
+        for name in converted:
+            self.assertTrue(should_convert_module(name, config.modules_to_not_convert), name)
+        restored = AutoQuantizationConfig.from_dict(config.to_dict())
+        self.assertEqual(restored.modules_to_not_convert, config.modules_to_not_convert)

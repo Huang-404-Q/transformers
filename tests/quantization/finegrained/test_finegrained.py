@@ -14,35 +14,54 @@
 """The fine-grained quantizer (`FineGrainedConfig`): a plan mixing the format quantizers, the checkpoints that
 read into one, and the conversions it builds. Each format's own coverage lives in its folder."""
 
+import os
+import tempfile
 import unittest
 import warnings
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+from parameterized import parameterized
 from torch import nn
 
-from transformers import DeepseekV4Config
+import transformers.integrations.finegrained.layers as fg
+from transformers import AutoModelForCausalLM, DeepseekV4Config, PreTrainedConfig, PreTrainedModel
 from transformers.quantizers.auto import AutoQuantizationConfig
 from transformers.testing_utils import (
     TestCasePlus,
+    cleanup,
+    require_kernels,
     require_torch,
+    require_torch_accelerator,
+    slow,
+    torch_device,
 )
 from transformers.utils.quantization_config import (
+    BitsAndBytesConfig,
     BlockScaledConfig,
     FineGrainedConfig,
     Fp8Config,
     Mxfp4Config,
+    NVFP4Config,
 )
 
 from ...integrations.finegrained.utils import (
+    _Cfg,
     _conversion_model,
     _quantizer_for,
+    _targets,
 )
 from ..block_scaled_checkpoint_tester import TinyCheckpointTesterMixin
 from ..block_scaled_parallel_tester import LoadPathEquivalenceTesterMixin
 from ..block_scaled_tester import (
     FINEGRAINED,
     FORMATS,
+    FP8,
+    MXFP4,
+    NVFP4,
+    _cheap_tuning,
+    _require_kernel_capability,
 )
 
 
@@ -98,6 +117,35 @@ class FineGrainedPlanTest(unittest.TestCase):
             self.assertIsInstance(merged, FineGrainedConfig)
             self.assertTrue(merged.dequantize)
 
+    def test_related_config_classes_lend_their_loading_attributes(self):
+        """A format config lends a plan its loading options and its activation format to the plan's entries in its
+        format; a plan in a checkpoint's one format lends them back. Unrelated classes are refused."""
+        from transformers.quantizers.auto import AutoHfQuantizer
+        from transformers.quantizers.quantizers_utils import EXPERTS_PATTERN
+
+        checkpoint = FineGrainedConfig(
+            dtype_plan={EXPERTS_PATTERN: NVFP4Config(activation_format="bf16"), ".*": Fp8Config()}
+        )
+        merged = AutoHfQuantizer.merge_quantization_configs(
+            checkpoint.to_dict(), Fp8Config(modules_to_not_convert=["lm_head"])
+        )
+        experts, rest = merged.dtype_plan[EXPERTS_PATTERN], merged.dtype_plan[".*"]
+        self.assertEqual((type(experts), experts.activation_format), (NVFP4Config, "bf16"))
+        self.assertEqual((rest.activation_format, merged.modules_to_not_convert), (None, ["lm_head"]))
+
+        merged = AutoHfQuantizer.merge_quantization_configs(
+            {"quant_method": "fp8"},
+            FineGrainedConfig(dtype_plan={".*": Fp8Config()}, dequantize=True),
+        )
+        self.assertEqual((type(merged), merged.activation_format, merged.dequantize), (Fp8Config, None, True))
+        for checkpoint, passed in (
+            ({"quant_method": "fp8"}, Mxfp4Config(dequantize=True)),
+            ({"quant_method": "fp8"}, FineGrainedConfig(dtype_plan={".*": Mxfp4Config()})),
+            (checkpoint.to_dict(), BitsAndBytesConfig(load_in_8bit=True)),
+        ):
+            with self.subTest(passed=type(passed).__name__), self.assertRaises(ValueError):
+                AutoHfQuantizer.merge_quantization_configs(checkpoint, passed)
+
     def test_an_expert_dtype_in_the_quantization_config_reads_as_the_same_plan(self):
         """DeepSeek-V4.1 declares its FP4 experts in the quantization config instead of the model config: the same
         plan, block-FP8 at the checkpoint's block over W4A4 MXFP4 experts, whichever config the load is handed."""
@@ -126,6 +174,30 @@ class FineGrainedPlanTest(unittest.TestCase):
                 # the loading options are the plan's, not an entry's
                 self.assertEqual((config.dequantize, rest.dequantize), (passed.dequantize, False))
 
+    def test_resolution_survives_a_round_trip_through_config_json(self):
+        """`to_json_string` SORTS keys, so a config read back has lost the order it was written
+        in. Resolution must not depend on it: the catch-all sorts first here and would swallow
+        every module if targeted entries were not preferred outright."""
+        import json
+
+        from transformers.quantizers.quantizers_utils import plan_entry_for
+
+        config = FineGrainedConfig(
+            dtype_plan={r"\.experts($|\.)": NVFP4Config(), ".*": Fp8Config(weight_block_size=(128, 128))}
+        )
+        back = FineGrainedConfig.from_dict(json.loads(config.to_json_string()))
+        self.assertIsInstance(plan_entry_for(back.dtype_plan, "model.layers.0.mlp.experts"), NVFP4Config)
+        self.assertIsInstance(plan_entry_for(back.dtype_plan, "model.layers.0.self_attn.q_proj"), Fp8Config)
+        # a list survives JSON where a tuple does not, and the block size is compared as a tuple
+        self.assertEqual(back.dtype_plan[".*"].weight_block_size, (128, 128))
+
+    def test_two_targeted_entries_claiming_one_module_is_an_error(self):
+        from transformers.quantizers.quantizers_utils import plan_entry_for
+
+        plan = {r"\.experts": Fp8Config(weight_block_size=None), r"mlp\.": NVFP4Config()}
+        with self.assertRaises(ValueError):
+            plan_entry_for(plan, "model.layers.0.mlp.experts")
+
     def test_expert_dtype_reaches_a_config_quantizing_on_the_fly(self):
         """The checkpoint an on-the-fly quantization writes declares the model config's `expert_dtype`, and is read
         back with it: the experts are quantized to MXFP4 then, so the save loads as what it holds."""
@@ -143,6 +215,13 @@ class FineGrainedPlanTest(unittest.TestCase):
     def test_the_base_config_is_not_a_format(self):
         with self.assertRaises(TypeError):
             BlockScaledConfig()
+
+    def test_the_plans_members_load_as_the_host_does(self):
+        from transformers.quantizers.quantizer_finegrained import FineGrainedHfQuantizer
+
+        config = FineGrainedConfig(dtype_plan={r"\.experts($|\.)": NVFP4Config(), ".*": Fp8Config()})
+        quantizer = FineGrainedHfQuantizer(config, pre_quantized=False)
+        self.assertEqual([member.pre_quantized for member in quantizer.members()], [False, False])
 
     def test_ep_plans_use_masked_routing_for_every_format(self):
         configs = [spec.config_cls() for spec in FORMATS]
@@ -173,10 +252,67 @@ class FineGrainedPlanTest(unittest.TestCase):
                     quantizer.update_parallel_plan(model, plan)
                     self.assertEqual(plan, expected)
 
+    def test_parallel_plans_replicate_the_per_tensor_scales(self):
+        """A per-tensor scale is 0-dim, with no axis to split: resolving the plans names each one a plan would shard
+        with its module `replicate`, which the parameter's own entry makes take precedence. A scale grid follows its
+        module's style."""
+        from transformers.distributed.tensor_parallel import ALL_PARALLEL_STYLES, resolve_parallel_plans
+        from transformers.integrations.finegrained import FineGrainedLinear
+        from transformers.quantizers.quantizer_nvfp4 import NVFP4HfQuantizer
+
+        model = nn.Module()
+        model.q_proj = FineGrainedLinear(64, 64, quantization_config=NVFP4Config())
+        model.o_proj = FineGrainedLinear(64, 64, quantization_config=NVFP4Config())
+        model.tp_plan, model.ep_plan = {"q_proj": "colwise"}, {}
+        model.config = SimpleNamespace(_experts_implementation=None)
+        NVFP4HfQuantizer(NVFP4Config()).update_parallel_plan(model, model.tp_plan)
+        distributed_config = SimpleNamespace(tp_plan=None, ep_plan=None, tp_size=2, ep_size=1)
+        tp_plan, _ = resolve_parallel_plans(model, distributed_config)
+        self.assertEqual(
+            tp_plan,
+            {"q_proj": "colwise", "q_proj.weight_global_scale": "replicate", "q_proj.activation_scale": "replicate"},
+        )
+        scale = model.q_proj.weight_global_scale
+        ALL_PARALLEL_STYLES["replicate"].shard_param(model.q_proj, "weight_global_scale", mesh=None)
+        self.assertIs(model.q_proj.weight_global_scale, scale)
+
 
 @require_torch
 class FineGrainedPlanConversionTest(unittest.TestCase):
     """The conversions a plan of several formats builds."""
+
+    def test_input_scale_reaches_each_formats_own_slot(self):
+        """One checkpoint key, two formats: `input_scale` is a static FP8 module's activation scale and an
+        NVFP4 module's activation global, held in one slot either way. Only the format holding the experts
+        reads their keys, and two formats that both would refuse the plan."""
+        from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+        from transformers.quantizers.quantizer_finegrained import FineGrainedHfQuantizer
+        from transformers.quantizers.quantizers_utils import EXPERTS_PATTERN
+
+        config = FineGrainedConfig(
+            dtype_plan={
+                EXPERTS_PATTERN: NVFP4Config(activation_format="nvfp4"),
+                ".*": Fp8Config(weight_block_size=None, activation_scheme="static"),
+            },
+        )
+        quantizer = FineGrainedHfQuantizer(config)
+        quantizer.pre_quantized = True
+        fp8 = next(member for member in quantizer.members() if member.quantization_config is config.dtype_plan[".*"])
+        model = _conversion_model(quantizer)
+        self.assertEqual(fp8._up_projections(model), ())
+        conversions = quantizer.update_weight_conversions([], model)
+        renamings = [c for c in conversions if isinstance(c, WeightRenaming)]
+        converters = [c for c in conversions if isinstance(c, WeightConverter)]
+
+        renamed, _ = rename_source_key("model.layers.0.self_attn.q_proj.input_scale", renamings, converters)
+        self.assertEqual(renamed, "model.layers.0.self_attn.q_proj.activation_scale")
+        _, pattern = rename_source_key("model.layers.0.mlp.experts.3.down_proj.input_scale", renamings, converters)
+        (converter,) = [c for c in converters if pattern in c.source_patterns]
+        self.assertIn("experts.down_proj_activation_scale", _targets(converter))
+        self.assertIn("experts.down_proj_weight_global_scale", _targets(converter))
+
+        with mock.patch.object(fp8, "_up_projections", return_value=("gate_up_proj",)), self.assertRaises(ValueError):
+            quantizer.update_weight_conversions([], model)
 
     @staticmethod
     def _split(conversions):
@@ -198,6 +334,168 @@ class FineGrainedPlanConversionTest(unittest.TestCase):
                 quantizer = _quantizer_for(Fp8Config(dequantize=dequantize))
                 (rewritten, *_) = quantizer.update_weight_conversions([model_converter], _conversion_model(quantizer))
                 self.assertTrue(rewritten.force_cpu)
+
+    def test_experts_under_any_parent_and_ungated_stacks_get_their_converters(self):
+        """Nemotron-H holds its experts under `mixer.experts`, ungated (`up_proj`): the per-expert scales reach that
+        stack, and its scales take the swizzle op without the gate|up interleave."""
+        from transformers.core_model_loading import rename_source_key
+        from transformers.integrations.finegrained.conversions import (
+            FineGrainedInterleaveGateUp,
+            FineGrainedSwizzleScales,
+        )
+        from transformers.integrations.moe import use_experts_implementation
+
+        @use_experts_implementation(has_gate=False)
+        class UngatedExperts(nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.up_proj = nn.Parameter(
+                    torch.empty(_Cfg.num_local_experts, _Cfg.intermediate_size, _Cfg.hidden_size)
+                )
+                self.down_proj = nn.Parameter(
+                    torch.empty(_Cfg.num_local_experts, _Cfg.hidden_size, _Cfg.intermediate_size)
+                )
+
+        class HybridModel(PreTrainedModel):
+            config: PreTrainedConfig
+
+            def __init__(self, config):
+                super().__init__(config)
+                self.layers = nn.ModuleList([nn.Module()])
+                self.layers[0].mixer = nn.Module()
+                self.layers[0].mixer.experts = UngatedExperts(config)
+                self.post_init()
+
+            def _init_weights(self, module):
+                pass
+
+        config = PreTrainedConfig()
+        for name in ("hidden_size", "intermediate_size", "num_local_experts", "hidden_act"):
+            setattr(config, name, getattr(_Cfg, name))
+        model = HybridModel(config)
+        quantizer = _quantizer_for(NVFP4Config())
+        with mock.patch.object(fg, "is_sm100", return_value=False):
+            quantizer._process_model_before_weight_loading(model)
+        renamings, converters = self._split(
+            quantizer.format_conversions(dequantize=False, up_projections=quantizer._up_projections(model))
+        )
+        for shipped, slot in (("weight_scale_2", "weight_global_scale"), ("input_scale", "activation_scale")):
+            with self.subTest(key=shipped):
+                renamed, _ = rename_source_key(f"layers.0.mixer.experts.3.up_proj.{shipped}", renamings, converters)
+                self.assertEqual(renamed, f"layers.0.mixer.experts.up_proj_{slot}")
+
+        ops = quantizer.get_param_ops(model, "layers.0.mixer.experts.up_proj_scale_inv")
+        self.assertTrue(any(isinstance(op, FineGrainedSwizzleScales) for op in ops))
+        self.assertFalse(any(isinstance(op, FineGrainedInterleaveGateUp) for op in ops))
+
+    def test_an_embedding_tables_own_scale_keeps_its_name(self):
+        """modelopt and compressed-tensors name a block scale `weight_scale`, as a quantized embedding table names its
+        per-tensor one: the rename onto the block-scale slot leaves the tables `modules_to_convert` names alone."""
+        from transformers.core_model_loading import rename_source_key
+
+        for config in (
+            FineGrainedConfig(dtype_plan={".*": NVFP4Config()}, modules_to_convert=["embed_tokens"]),
+            Fp8Config(checkpoint_format="compressed-tensors", modules_to_convert=["embed_tokens"]),
+        ):
+            with self.subTest(config=type(config).__name__):
+                renamings, converters = self._split(
+                    _quantizer_for(config).update_weight_conversions([], _conversion_model(_quantizer_for(config)))
+                )
+                for key, expected in (
+                    ("model.embed_tokens.weight_scale", "model.embed_tokens.weight_scale"),
+                    (
+                        "model.layers.0.self_attn.q_proj.weight_scale",
+                        "model.layers.0.self_attn.q_proj.weight_scale_inv",
+                    ),
+                ):
+                    self.assertEqual(rename_source_key(key, renamings, converters)[0], expected)
+
+
+# Each format once on each side, over the activation formats that take distinct kernel arms: W8A8 block-FP8 over
+# weight-only NVFP4, and W4A4 NVFP4 over W4A4 MXFP4.
+MIXED_PAIRS = [
+    (f"{experts.name}_{experts_activation}_x_{dense.name}_{dense_activation}", *pair)
+    for pair in (
+        (FP8, None, NVFP4, "bf16"),
+        (NVFP4, None, MXFP4, None),
+    )
+    for experts, experts_activation, dense, dense_activation in [pair]
+]
+
+
+@slow
+@require_kernels
+@require_torch_accelerator
+class FineGrainedMixedSchemesTest(TestCasePlus):
+    """One model quantized in two schemes, its experts in one and every other linear in the other: each module
+    is built in its own plan entry's scheme, the forward stays near the bf16 model, and a save reloads to the
+    same logits, which composes the schemes' arms from the saved plan."""
+
+    @classmethod
+    def setUpClass(cls):
+        from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+        super().setUpClass()
+        cls.enterClassContext(_cheap_tuning())
+        cls.bf16_dir = cls.enterClassContext(tempfile.TemporaryDirectory())
+        config = Qwen3MoeConfig(
+            vocab_size=1024,
+            hidden_size=256,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            num_experts=8,
+            num_experts_per_tok=2,
+        )
+        torch.manual_seed(0)
+        reference = Qwen3MoeForCausalLM(config).to(torch.bfloat16)
+        reference.save_pretrained(cls.bf16_dir)
+        cls.ids = torch.arange(3, 35, dtype=torch.long, device=torch_device).unsqueeze(0)
+        with torch.no_grad():
+            cls.want = reference.to(torch_device)(cls.ids).logits.float()
+
+    def setUp(self):
+        super().setUp()
+        _require_kernel_capability(self)
+
+    def tearDown(self):
+        cleanup(torch_device, gc_collect=True)
+        super().tearDown()
+
+    @parameterized.expand(MIXED_PAIRS)
+    def test_mixed_schemes_load_save_and_reload(self, _, experts, experts_activation, dense, dense_activation):
+        from transformers.quantizers.quantizers_utils import EXPERTS_PATTERN
+
+        experts_type = experts.config_cls(activation_format=experts_activation)
+        dense_type = dense.config_cls(activation_format=dense_activation)
+        quantization_config = FineGrainedConfig(dtype_plan={EXPERTS_PATTERN: experts_type, ".*": dense_type})
+        model = AutoModelForCausalLM.from_pretrained(
+            self.bf16_dir, quantization_config=quantization_config, device_map=torch_device
+        )
+        layer = model.model.layers[0]
+        for module, expected in ((layer.mlp.experts, experts_type), (layer.self_attn.q_proj, dense_type)):
+            self.assertEqual(
+                (module.weight_format, module.activation_format), (expected.quant_method, expected.activation_format)
+            )
+
+        ids, want = self.ids, self.want
+        with torch.no_grad():
+            logits = model(ids).logits.float()
+        error = ((logits - want).norm() / want.norm()).item()
+        self.assertLess(error, 0.5, f"{error:.3f} off bf16")
+
+        saved = os.path.join(self.get_auto_remove_tmp_dir(), "saved")
+        model.save_pretrained(saved)
+        reloaded, info = AutoModelForCausalLM.from_pretrained(saved, device_map=torch_device, output_loading_info=True)
+        self.assertEqual(
+            (set(info["missing_keys"]), set(info["unexpected_keys"]), set(info["mismatched_keys"])),
+            (set(), set(), set()),
+        )
+        with torch.no_grad():
+            torch.testing.assert_close(reloaded(ids).logits.float(), logits, rtol=1e-2, atol=1e-2)
 
 
 class FineGrainedTinyCheckpointTest(TinyCheckpointTesterMixin, TestCasePlus):

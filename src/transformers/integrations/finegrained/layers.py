@@ -218,7 +218,9 @@ def finegrained_linear(
 def supported_fused_norms() -> dict[type[nn.Module], str]:
     """The kernels' fused form of a post-expert norm, by the norm's exact class: a subclass may compute something
     else. Built on first use, so that importing this module does not import a model."""
-    return {nn.RMSNorm: "rms_norm"}
+    from ...models.muse_spark.modeling_muse_spark import MuseSparkTextInputScaledRMSNorm
+
+    return {nn.RMSNorm: "rms_norm", MuseSparkTextInputScaledRMSNorm: "input_scaled_rms_norm"}
 
 
 class _FineGrainedModule:
@@ -566,6 +568,8 @@ class FineGrainedExperts(_FineGrainedModule, nn.Module):
         # a full-precision stack quantized on load arrives in the layout of the module this replaces
         self.ships_transposed = ships_transposed
 
+        # set by `register_shared_gate_up_input_globals`
+        self.register_buffer("shared_gate_up_input_global", None, persistent=False)
         # what `_moe_operands` hands the kernels besides tensors, resolved on the first MoE forward
         self._static_moe_operands = None
 
@@ -660,10 +664,13 @@ class FineGrainedExperts(_FineGrainedModule, nn.Module):
 
     def _projection_operands(self, proj: str) -> ProjectionOperands:
         """``proj``'s tensors as the kernels take them: the calibrated activation scale goes in as NVFP4's
-        activation global or as a static scale."""
+        activation global (the gate_up's shared one where it is set) or as a static scale."""
         weight, scale_inv, weight_global, activation, bias = (
             self._parameters[name] for name in _PROJECTION_SLOTS[proj]
         )
+        shared = self._buffers["shared_gate_up_input_global"]
+        if shared is not None and proj == self.gate_up_name:
+            activation = shared
         activation_scale, input_global_scale = self._activation_operands(activation)
         return ProjectionOperands(weight, scale_inv, weight_global, input_global_scale, activation_scale, bias)
 
@@ -772,6 +779,22 @@ def assert_modules_are_quantized(model: nn.Module) -> None:
                     "weight — this checkpoint does not quantize it. Name the module in the "
                     "quantization config's `modules_to_not_convert` to leave it as it is."
                 )
+
+
+def register_shared_gate_up_input_globals(model: nn.Module) -> None:
+    """Share the experts' gate_up NVFP4 activation global, as the max of their calibrated ones, where the config's
+    `shared_gate_up_activation_global` asks for it (see `NVFP4Config`)."""
+    for module in model.modules():
+        if not isinstance(module, FineGrainedExperts):
+            continue
+        scope = getattr(module.quantization_config, "shared_gate_up_activation_global", None)
+        if scope is None:
+            continue
+        input_global = getattr(module, f"{module.gate_up_name}_activation_scale")
+        if input_global is not None:
+            if hasattr(input_global, "full_tensor"):  # sharded over experts
+                input_global = input_global.full_tensor() if scope == "global" else input_global.to_local()
+            module.shared_gate_up_input_global = input_global.detach().amax().reshape(1)
 
 
 def disable_deepgemm_on_multi_device(model: nn.Module) -> None:

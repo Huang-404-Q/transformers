@@ -812,3 +812,14 @@ class DeepGemmQuantizedExpertsOperandsTest(unittest.TestCase):
                 with self.subTest(forward=forward.__name__), self.assertRaisesRegex(NotImplementedError, message):
                     forward(experts, hidden, *routing)
         load.assert_not_called()
+
+    def test_operands_the_kernels_would_drop_are_refused(self):
+        from transformers.utils.quantization_config import Mxfp4Config, NVFP4Config
+
+        for experts, message in (
+            (self._experts(Fp8Config(weight_block_size=(128, 128)), has_bias=True), "bias"),
+            (self._experts(NVFP4Config()), "NVFP4"),
+            (self._experts(Mxfp4Config(activation_format="bf16")), "weight-only"),
+        ):
+            with self.subTest(message=message):
+                self._assert_refused(experts, message)
