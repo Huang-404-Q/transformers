@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+import json
 import warnings
 from collections.abc import Callable
 
@@ -23,9 +25,11 @@ from ..utils.quantization_config import (
     AwqConfig,
     BitNetQuantConfig,
     BitsAndBytesConfig,
+    BlockScaledConfig,
     CompressedTensorsConfig,
     EetqConfig,
     FbgemmFp8Config,
+    FineGrainedConfig,
     FineGrainedFP8Config,
     FourOverSixConfig,
     FPQuantConfig,
@@ -56,6 +60,7 @@ from .quantizer_bnb_8bit import Bnb8BitHfQuantizer
 from .quantizer_compressed_tensors import CompressedTensorsHfQuantizer
 from .quantizer_eetq import EetqHfQuantizer
 from .quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
+from .quantizer_finegrained import FineGrainedHfQuantizer
 from .quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from .quantizer_fouroversix import FourOverSixHfQuantizer
 from .quantizer_fp_quant import FPQuantHfQuantizer
@@ -94,16 +99,15 @@ AUTO_QUANTIZER_MAPPING = {
     "bitnet": BitNetHfQuantizer,
     "vptq": VptqHfQuantizer,
     "spqr": SpQRHfQuantizer,
-    "fp8": FineGrainedFP8HfQuantizer,
     "gguf": GgufHfQuantizer,
-    "nvfp4": NVFP4HfQuantizer,
-    # MXFP8 = FP8 (E4M3 weights) with per-block ``[1, 32]`` E8M0 (uint8) scales —
-    # reuses the FineGrainedFP8 dequant path, with the E8M0 byte→exponent
-    # unpacking handled inside ``Fp8Dequantize._dequantize_one``.
-    "mxfp8": FineGrainedFP8HfQuantizer,
-    "auto-round": AutoRoundQuantizer,
-    "mxfp4": Mxfp4HfQuantizer,
     "metal": MetalHfQuantizer,
+    "auto-round": AutoRoundQuantizer,
+    # fine-grained: one quantizer per weight format, and one hosting several on the parts of a model
+    "fp8": FineGrainedFP8HfQuantizer,
+    "mxfp8": FineGrainedFP8HfQuantizer,
+    "mxfp4": Mxfp4HfQuantizer,
+    "nvfp4": NVFP4HfQuantizer,
+    "finegrained": FineGrainedHfQuantizer,
     "sinq": SinqHfQuantizer,
     "gemma": GemmaQuantizer,
 }
@@ -128,12 +132,13 @@ AUTO_QUANTIZATION_CONFIG_MAPPING = {
     "bitnet": BitNetQuantConfig,
     "vptq": VptqConfig,
     "spqr": SpQRConfig,
-    "fp8": FineGrainedFP8Config,
-    "nvfp4": NVFP4Config,
-    "mxfp8": FineGrainedFP8Config,
-    "auto-round": AutoRoundConfig,
-    "mxfp4": Mxfp4Config,
     "metal": MetalConfig,
+    "auto-round": AutoRoundConfig,
+    "fp8": FineGrainedFP8Config,
+    "mxfp8": FineGrainedFP8Config,
+    "mxfp4": Mxfp4Config,
+    "nvfp4": NVFP4Config,
+    "finegrained": FineGrainedConfig,
     "sinq": SinqConfig,
     "gemma": GemmaQuantizationConfig,
 }
@@ -153,6 +158,8 @@ LOADING_ATTRIBUTES_CONFIG_TYPES = (
     CompressedTensorsConfig,
     Mxfp4Config,
     MetalConfig,
+    FineGrainedConfig,
+    BlockScaledConfig,
     FineGrainedFP8Config,
 )
 
@@ -277,20 +284,37 @@ class AutoHfQuantizer:
                 )
             quantization_config_from_args = lender
 
+        ignored = []
         if isinstance(quantization_config, LOADING_ATTRIBUTES_CONFIG_TYPES) and isinstance(
             quantization_config_from_args, LOADING_ATTRIBUTES_CONFIG_TYPES
         ):
             loading_attr_dict = quantization_config_from_args.get_loading_attributes()
+            if isinstance(quantization_config_from_args, (BlockScaledConfig, FineGrainedConfig)):
+                ignored = _ignored_options(quantization_config, quantization_config_from_args, loading_attr_dict)
             for attr, val in loading_attr_dict.items():
+                if attr == "dtype_plan" and isinstance(quantization_config, FineGrainedConfig):
+                    val = _with_activation_formats(quantization_config.dtype_plan, val)
                 setattr(quantization_config, attr, val)
+            if isinstance(quantization_config, BlockScaledConfig):
+                # the passed attributes must also hold together with the checkpoint's
+                quantization_config.post_init()
 
             if loading_attr_dict:
                 warning_msg += f"However, loading attributes (e.g. {list(loading_attr_dict.keys())}) will be overwritten with the one you passed to `from_pretrained`. The rest will be ignored."
+            if ignored:
+                warning_msg += f" Ignored: {ignored}."
 
-        if warning_msg != "" and not isinstance(quantization_config, (Mxfp4Config, MetalConfig, FineGrainedFP8Config)):
+        # the block-scaled formats take a passed config for its loading attributes, so that alone is not worth a warning
+        lends_only = (
+            isinstance(
+                quantization_config,
+                (Mxfp4Config, MetalConfig, FineGrainedConfig, BlockScaledConfig, FineGrainedFP8Config),
+            )
+            and not ignored
+        )
+        if warning_msg != "" and not lends_only:
             warnings.warn(warning_msg)
         else:
-            # in the case of mxfp4, we don't want to print the warning message, bit confusing for users
             logger.info(warning_msg)
         return quantization_config
 
@@ -362,6 +386,52 @@ def register_quantizer(name: str):
         return cls
 
     return register_quantizer_fn
+
+
+def _as_json(config) -> dict:
+    """`config` as `config.json` holds it, so a tuple and the list it serializes to compare equal."""
+    return json.loads(config.to_json_string(use_diff=False))
+
+
+def _set_options(config) -> dict:
+    """The options `config` sets away from its class's defaults."""
+    defaults = _as_json(type(config)())
+    return {name: value for name, value in _as_json(config).items() if defaults.get(name) != value}
+
+
+def _ignored_options(quantization_config, quantization_config_from_args, loading_attributes: dict) -> list[str]:
+    """The options a config passed for a pre-quantized checkpoint sets away from its defaults, differently from the
+    checkpoint's own, and that are not loading attributes, so the checkpoint's stand; a passed plan's, per entry."""
+    own, passed = _as_json(quantization_config), _set_options(quantization_config_from_args)
+    ignored = [
+        name
+        for name, value in passed.items()
+        if name not in loading_attributes and name != "quant_method" and own.get(name) != value
+    ]
+    for pattern, entry in loading_attributes.get("dtype_plan", {}).items():
+        own_entry = quantization_config.dtype_plan.get(pattern)
+        if type(own_entry) is not type(entry):
+            ignored.append(f"dtype_plan[{pattern!r}]")
+            continue
+        own_options = _as_json(own_entry)
+        ignored += [
+            f"dtype_plan[{pattern!r}].{name}"
+            for name, value in _set_options(entry).items()
+            if name != "activation_format" and own_options.get(name) != value
+        ]
+    return ignored
+
+
+def _with_activation_formats(dtype_plan: dict, passed_plan: dict) -> dict:
+    """`dtype_plan` with the activation format of each `passed_plan` entry naming the same format under the same
+    pattern: the kernels the same weights run on."""
+    merged = dict(dtype_plan)
+    for pattern, entry in passed_plan.items():
+        if type(merged.get(pattern)) is type(entry) and entry._names_activation_format:
+            merged[pattern] = copy.copy(merged[pattern])
+            merged[pattern].activation_format = entry.activation_format
+            merged[pattern].post_init()
+    return merged
 
 
 def get_hf_quantizer(config, quantization_config, device_map, weights_only, user_agent, gguf_file=None):
