@@ -82,6 +82,26 @@ class FineGrainedModulesTest(unittest.TestCase):
             self.assertEqual(result["linear.weight"].dtype, torch.float8_e4m3fn)
             self.assertEqual(result["linear.weight_scale_inv"].dtype, torch.float32)
 
+    def test_ue8m0_falls_back_to_exponent_bytes(self):
+        from transformers.integrations.finegrained.conversions import FineGrainedQuantize, as_container
+        from transformers.integrations.finegrained.formats import ue8m0_dtype
+        from transformers.utils.quantization_config import Mxfp8Config
+
+        ue8m0_dtype.cache_clear()
+        try:
+            with mock.patch.object(torch, "float8_e8m0fnu", create=True):
+                del torch.float8_e8m0fnu
+                self.assertEqual(ue8m0_dtype(), torch.uint8)
+                linear = FineGrainedLinear(64, 64, quantization_config=Mxfp8Config())
+                self.assertEqual(linear.weight_scale_inv.dtype, torch.uint8)
+                scales = torch.tensor([0.5, 1.0, 2.0, 4.0])
+                encoded = as_container(scales, torch.uint8)
+                torch.testing.assert_close(encoded, torch.tensor([126, 127, 128, 129], dtype=torch.uint8))
+                _, scale = FineGrainedQuantize._quantize_block_fp8(torch.full((2, 2), 448.0), (2, 2), True)
+                torch.testing.assert_close(scale, torch.tensor([[127]], dtype=torch.uint8))
+        finally:
+            ue8m0_dtype.cache_clear()
+
     def test_only_weights_need_on_the_fly_quantization(self):
         config = Fp8Config()
         quantizer = _quantizer_for(config)

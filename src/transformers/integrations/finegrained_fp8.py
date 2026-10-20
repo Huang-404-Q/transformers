@@ -41,7 +41,7 @@ from .moe import ExpertsInterface, use_experts_implementation
 
 warnings.warn(
     "`transformers.integrations.finegrained_fp8` is frozen and will be removed in a future release; "
-    "`Fp8Config` loads through `transformers.integrations.finegrained`.",
+    "`Fp8Config` and `Mxfp8Config` load through `transformers.integrations.finegrained`.",
     DeprecationWarning,
     stacklevel=2,
 )

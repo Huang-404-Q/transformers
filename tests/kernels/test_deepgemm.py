@@ -53,6 +53,7 @@ from transformers.integrations.deepgemm import (
     deepgemm_fp8_fp4_megamoe_experts_forward,
 )
 from transformers.integrations.finegrained import FineGrainedLinear
+from transformers.integrations.moe import check_experts_weight_layout
 from transformers.testing_utils import (
     require_torch,
     require_torch_gpu,
@@ -60,7 +61,7 @@ from transformers.testing_utils import (
     require_torch_multi_gpu,
     torch_device,
 )
-from transformers.utils.quantization_config import Fp8Config
+from transformers.utils.quantization_config import Fp8Config, Mxfp8Config
 
 from ..integrations.finegrained.utils import _Cfg, fake_finegrained_kernel, patch_finegrained_kernel
 from .test_utils import make_experts, make_fp8_experts
@@ -812,6 +813,27 @@ class DeepGemmQuantizedExpertsOperandsTest(unittest.TestCase):
                 with self.subTest(forward=forward.__name__), self.assertRaisesRegex(NotImplementedError, message):
                     forward(experts, hidden, *routing)
         load.assert_not_called()
+
+    def test_a_layout_loaded_for_triton_is_refused(self):
+        """A module loaded for a triton backend holds gate|up interleaved (its block grid interleaved per block,
+        which a row-major read pairs with the wrong half) and, for MX on SM100, its scales swizzled (a non-gated
+        module too, whose single up projection has no gate|up order to tell the layouts apart): a switch to a
+        DeepGEMM backend is refused rather than read as affine and stacked."""
+        with (
+            mock.patch.object(fg, "is_sm100", return_value=True),
+            mock.patch("torch.cuda.is_available", return_value=True),
+        ):
+            modules = [self._experts(Fp8Config(weight_block_size=(128, 128)), impl="grouped_mm")]
+            modules += [
+                self._experts(Mxfp8Config(), impl="grouped_mm", has_gate=has_gate) for has_gate in (True, False)
+            ]
+        self.assertTrue(modules[0].holds_interleaved_gate_up)
+        self.assertEqual([m.down_proj_scale_inv.ndim for m in modules[1:]], [5, 5])
+        for experts in modules:
+            for implementation in ("deepgemm", "deepgemm_megamoe"):
+                with self.subTest(implementation), self.assertRaises(NotImplementedError):
+                    check_experts_weight_layout(experts, implementation)
+            check_experts_weight_layout(experts, "batched_mm")
 
     def test_operands_the_kernels_would_drop_are_refused(self):
         from transformers.utils.quantization_config import Mxfp4Config, NVFP4Config

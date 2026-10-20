@@ -152,6 +152,32 @@ class BlockScaledCheckpointReaderTest(unittest.TestCase):
         ):
             self.assertIsNone(read_compressed_tensors(checkpoint))
 
+    def test_activations_the_weights_kernels_do_not_serve_stay_with_compressed_tensors(self):
+        """An activation scheme is read only where the weights' kernels serve it: NVFP4 weights with FP8 per-token
+        activations and FP8 weights with int8 activations stay compressed-tensors' own, as do
+        group-32 FP8 weights whose scales are not E8M0 (MXFP8's)."""
+        from transformers.utils.quantization_config import Mxfp8Config, read_compressed_tensors
+
+        nvfp4 = {"num_bits": 4, "type": "float", "group_size": 16, "strategy": "tensor_group"}
+        block = {"num_bits": 8, "type": "float", "strategy": "block", "block_structure": [128, 128]}
+        fp8_token = {"num_bits": 8, "type": "float", "strategy": "token", "dynamic": True}
+        int8_token = {"num_bits": 8, "type": "int", "strategy": "token", "dynamic": True}
+        group_32 = {"num_bits": 8, "type": "float", "strategy": "group", "group_size": 32}
+        for name, checkpoint in (
+            ("nvfp4 x fp8", _compressed_tensors(nvfp4, fp8_token)),
+            ("block-fp8 x int8", _compressed_tensors(block, int8_token, fmt="float-quantized")),
+            (
+                "group-32 fp32 scales",
+                _compressed_tensors({**group_32, "scale_dtype": "torch.float32"}, group_32, fmt="float-quantized"),
+            ),
+        ):
+            with self.subTest(name):
+                self.assertIsNone(read_compressed_tensors(checkpoint))
+        e8m0 = {**group_32, "scale_dtype": "torch.float8_e8m0fnu"}
+        self.assertIsInstance(
+            read_compressed_tensors(_compressed_tensors(e8m0, group_32, fmt="float-quantized")), Mxfp8Config
+        )
+
     def test_unrepresentable_modelopt_targets_raise_before_loading(self):
         model = torch.nn.Module()
         model.linear = torch.nn.Linear(16, 16)

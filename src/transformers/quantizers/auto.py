@@ -41,6 +41,7 @@ from ..utils.quantization_config import (
     HqqConfig,
     MetalConfig,
     Mxfp4Config,
+    Mxfp8Config,
     NVFP4Config,
     QuantizationConfigMixin,
     QuantizationMethod,
@@ -64,7 +65,6 @@ from .quantizer_compressed_tensors import CompressedTensorsHfQuantizer
 from .quantizer_eetq import EetqHfQuantizer
 from .quantizer_fbgemm_fp8 import FbgemmFp8HfQuantizer
 from .quantizer_finegrained import FineGrainedHfQuantizer
-from .quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from .quantizer_fouroversix import FourOverSixHfQuantizer
 from .quantizer_fp8 import Fp8HfQuantizer
 from .quantizer_fp_quant import FPQuantHfQuantizer
@@ -75,6 +75,7 @@ from .quantizer_higgs import HiggsHfQuantizer
 from .quantizer_hqq import HqqHfQuantizer
 from .quantizer_metal import MetalHfQuantizer
 from .quantizer_mxfp4 import Mxfp4HfQuantizer
+from .quantizer_mxfp8 import Mxfp8HfQuantizer
 from .quantizer_nvfp4 import NVFP4HfQuantizer
 from .quantizer_quanto import QuantoHfQuantizer
 from .quantizer_quark import QuarkHfQuantizer
@@ -108,7 +109,7 @@ AUTO_QUANTIZER_MAPPING = {
     "auto-round": AutoRoundQuantizer,
     # fine-grained: one quantizer per weight format, and one hosting several on the parts of a model
     "fp8": Fp8HfQuantizer,
-    "mxfp8": FineGrainedFP8HfQuantizer,
+    "mxfp8": Mxfp8HfQuantizer,
     "mxfp4": Mxfp4HfQuantizer,
     "nvfp4": NVFP4HfQuantizer,
     "finegrained": FineGrainedHfQuantizer,
@@ -139,7 +140,7 @@ AUTO_QUANTIZATION_CONFIG_MAPPING = {
     "metal": MetalConfig,
     "auto-round": AutoRoundConfig,
     "fp8": Fp8Config,
-    "mxfp8": FineGrainedFP8Config,
+    "mxfp8": Mxfp8Config,
     "mxfp4": Mxfp4Config,
     "nvfp4": NVFP4Config,
     "finegrained": FineGrainedConfig,
@@ -231,6 +232,8 @@ class AutoHfQuantizer:
             quantization_config = AutoQuantizationConfig.from_dict(quantization_config)
         # the deprecated config keeps its own, frozen integration
         if isinstance(quantization_config, FineGrainedFP8Config):
+            from .quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
+
             return FineGrainedFP8HfQuantizer(quantization_config, **kwargs)
 
         quant_method = quantization_config.quant_method
