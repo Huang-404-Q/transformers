@@ -86,5 +86,6 @@ New code uses the config of the checkpoint's format, with the same field names:
 
 | `FineGrainedFP8Config` | Use |
 |---|---|
+| `weight_block_size=[1, 32]` with `scale_fmt="ue8m0"` | [`Mxfp8Config`] |
 | any other `weight_block_size` | [`Fp8Config`] |
 | on a model whose config declares `expert_dtype="fp4"` (DeepSeek-V4) | [`Fp8Config`], which loads as a [`FineGrainedConfig`] |

@@ -16,7 +16,7 @@ rendered properly in your Markdown viewer.
 
 # Fine-grained
 
-[FP8](./fp8), [MXFP4](./mxfp4) and [NVFP4](./nvfp4) are block-scaled formats: low-precision
+[FP8](./fp8), [MXFP8](./mxfp8), [MXFP4](./mxfp4) and [NVFP4](./nvfp4) are block-scaled formats: low-precision
 weights with one scale per block or group of values. They share one integration and one kernel bundle,
 [finegrained-kernels](https://huggingface.co/kernels-community/finegrained-kernels), and each has its own config that
 quantizes a whole model. [`FineGrainedConfig`] mixes them in one model. This page covers what they share; the format
@@ -96,7 +96,7 @@ These checkpoints load as a [`FineGrainedConfig`] without one being passed:
   reads as a plan with one entry per group target.
 - ModelOpt `quant_algo="MIXED_PRECISION"` reads its `quantized_layers` mapping. Each module name covers that module
   and its descendants, and modules absent from the mapping stay in full precision. The supported algorithms are `FP8`
-  (calibrated per-tensor FP8), `NVFP4`, `MXFP4`, and the
+  (calibrated per-tensor FP8), `NVFP4`, `MXFP8`, `MXFP4`, and the
   `W4A16_NVFP4` / `W4A16_MXFP4` weight-only variants.
 
 ```json
