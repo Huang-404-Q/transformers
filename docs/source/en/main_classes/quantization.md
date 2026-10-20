@@ -98,6 +98,16 @@ Learn how to quantize models in the [Quantization](../quantization/overview) gui
 
 [[autodoc]] SpQRConfig
 
+## BlockScaledConfig
+
+The base class of the block-scaled format configs below; build one of them instead.
+
+[[autodoc]] BlockScaledConfig
+
+## FineGrainedConfig
+
+[[autodoc]] FineGrainedConfig
+
 ## FineGrainedFP8Config
 
 [[autodoc]] FineGrainedFP8Config
