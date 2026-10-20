@@ -45,6 +45,9 @@ def module_kind(module_name: str, module) -> str | None:
     return None
 
 
+EXPERTS_PATTERN = r"\.experts($|\.)"
+
+
 def embedding_pattern(name: str) -> str:
     """The `dtype_plan` key of a `modules_to_convert` entry, which names an embedding table by suffix."""
     return rf"{re.escape(name)}$"

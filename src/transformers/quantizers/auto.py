@@ -164,7 +164,6 @@ LOADING_ATTRIBUTES_CONFIG_TYPES = (
     AutoRoundConfig,
     FbgemmFp8Config,
     CompressedTensorsConfig,
-    Mxfp4Config,
     MetalConfig,
     FineGrainedConfig,
     BlockScaledConfig,
@@ -317,10 +316,7 @@ class AutoHfQuantizer:
 
         # the block-scaled formats take a passed config for its loading attributes, so that alone is not worth a warning
         lends_only = (
-            isinstance(
-                quantization_config,
-                (Mxfp4Config, MetalConfig, FineGrainedConfig, BlockScaledConfig, FineGrainedFP8Config),
-            )
+            isinstance(quantization_config, (MetalConfig, FineGrainedConfig, BlockScaledConfig, FineGrainedFP8Config))
             and not ignored
         )
         if warning_msg != "" and not lends_only:

@@ -15,6 +15,7 @@
 hand the kernels, and the parallel plans a quantized model needs. The kernel call contract lives in
 `tests/kernels/test_finegrained.py`, the conversion ops in `test_conversions.py`."""
 
+import pickle
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -115,6 +116,24 @@ class FineGrainedModulesTest(unittest.TestCase):
             _replace(model, Fp8Config())
         self.assertIsInstance(model.grouped, FineGrainedGroupedLinear)
         self.assertNotIsInstance(model.plain, FineGrainedGroupedLinear)
+
+    def test_replaced_experts_carry_their_flags_per_instance(self):
+        """`FineGrainedExperts` is decorated once: each replacement holds the flags of the experts it replaces on the
+        instance, the class stays as defined, and a replaced module pickles as the plain class."""
+        from transformers import GptOssConfig, GptOssForCausalLM
+
+        config = _tiny_config(GptOssConfig, intermediate_size=32, sliding_window=16)
+        model = GptOssForCausalLM(config)
+        _replace(model, Fp8Config())
+        experts = model.model.layers[0].mlp.experts
+        self.assertIs(type(experts), FineGrainedExperts)
+        self.assertEqual((experts.has_bias, experts.is_concatenated, experts.ships_transposed), (True, False, True))
+        self.assertEqual((FineGrainedExperts.has_bias, FineGrainedExperts.is_concatenated), (False, True))
+        direct = FineGrainedExperts(_Cfg(), quantization_config=_format_config("fp8"))
+        self.assertFalse(direct.has_bias)
+        restored = pickle.loads(pickle.dumps(experts))
+        self.assertIs(type(restored), FineGrainedExperts)
+        self.assertEqual((restored.has_bias, restored.is_concatenated), (True, False))
 
     def test_lookup_rescales_the_gathered_rows(self):
         torch.manual_seed(0)

@@ -29,7 +29,9 @@ from transformers import AutoModelForCausalLM
 from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
 from transformers.integrations.finegrained import FineGrainedExperts, FineGrainedLinear
 from transformers.quantizers.auto import AutoHfQuantizer
+from transformers.quantizers.quantizer_finegrained import FineGrainedHfQuantizer
 from transformers.quantizers.quantizer_fp8 import Fp8HfQuantizer
+from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
 from transformers.testing_utils import (
     require_accelerate,
     require_kernels,
@@ -37,7 +39,9 @@ from transformers.testing_utils import (
     torch_device,
 )
 from transformers.utils.quantization_config import (
+    FineGrainedConfig,
     Fp8Config,
+    Mxfp4Config,
 )
 
 from ..integrations.finegrained.utils import _Cfg, _conversion_model, _model_mapping, _quantizer_for
@@ -99,7 +103,38 @@ FP8 = FormatSpec(
     },
     distributed_models=("deepseek_v3-fp8", "mistral4-fp8_tensor_static"),
 )
-FORMATS = (FP8,)
+MXFP4 = FormatSpec(
+    name="mxfp4",
+    config_cls=Mxfp4Config,
+    quantizer_cls=Mxfp4HfQuantizer,
+    activation_formats=(None, "mxfp8", "mxfp4", "bf16"),
+    checkpoint_config=Mxfp4Config,
+    weight_bits=4,
+    quantize_kwargs={"activation_format": None},
+    checkpoint_keys=(
+        "model.layers.3.mlp.experts.gate_up_proj_blocks",
+        "model.layers.3.mlp.experts.gate_up_proj_scales",
+        "model.layers.3.mlp.experts.7.gate_proj.weight_scale_inv",
+    ),
+    # GPT-OSS's blocks + scales pair
+    dequantize_keys=(
+        "model.layers.0.mlp.experts.gate_up_proj_blocks",
+        "model.layers.0.mlp.experts.gate_up_proj_scales",
+    ),
+    tiny_checkpoints={"IlyasMoutawwakil/tiny-random-GptOss-MXFP4": 0.05},
+    distributed_models=("gpt_oss-mxfp4",),
+)
+FORMATS = (FP8, MXFP4)
+
+# Plans mixing the formats, as DeepSeek-V4 ships one (block-FP8 over MXFP4 experts).
+FINEGRAINED = FormatSpec(
+    name="finegrained",
+    config_cls=FineGrainedConfig,
+    quantizer_cls=FineGrainedHfQuantizer,
+    checkpoint_config=FineGrainedConfig,
+    tiny_checkpoints={"IlyasMoutawwakil/tiny-random-DeepseekV4-Flash": 0.25},
+    distributed_models=("deepseek_v4-fp4_experts+fp8_dense",),
+)
 
 
 @contextmanager
